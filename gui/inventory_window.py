@@ -580,35 +580,88 @@ class InventoryWindow(QMainWindow):
             data = item.data(0, Qt.ItemDataRole.UserRole)
             if not data: return
             text = item.text(2).strip()
+            
             if data["type"] == "product":
                 product = goods_cache.get_by_id(data["product_id"])
                 if not product: return
-                if not text: product.actual = None
+                
+                if not text:
+                    product.actual = None
                 else:
-                    try: product.actual = int(float(text))
+                    try:
+                        product.actual = int(float(text))
                     except ValueError:
                         previous = str(product.actual) if product.actual is not None else ""
-                        self.table.blockSignals(True); item.setText(2, previous); self.table.blockSignals(False); return
-                self._save_to_cache(product); self._update_product_item_display(item, product); self._update_parent_group(item)
+                        self.table.blockSignals(True)
+                        item.setText(2, previous)
+                        self.table.blockSignals(False)
+                        return
+                
+                self._save_to_cache(product)
+                self._update_product_item_display(item, product)
+                
+                # 🆕 АВТОЗАПОЛНЕНИЕ СИБЛИНГОВ
+                # Если пользователь заполнил один товар в группе — остальные незаполненные
+                # автоматически получают actual = stock ("сходится")
+                # Это защищает от случайной недостачи, когда пользователь забыл
+                # заполнить остальные вкусы в группе
+                parent = item.parent()
+                if parent and text:  # только если есть родитель (группа) И поле заполнено
+                    parent_data = parent.data(0, Qt.ItemDataRole.UserRole)
+                    if parent_data and parent_data.get("type") == "group":
+                        group = self._find_group_by_name(parent_data["group_name"])
+                        if group:
+                            auto_filled = 0
+                            for p in group.products:
+                                # Пропускаем сам редактируемый товар и уже заполненные
+                                if p.id == product.id:
+                                    continue
+                                if p.actual is not None:
+                                    continue  # уже заполнен — не трогаем
+                                # Автозаполнение: actual = stock (сходится)
+                                p.actual = p.stock
+                                self._save_to_cache(p)
+                                auto_filled += 1
+                            
+                            if auto_filled > 0:
+                                print(f"[AutoFill] ✓ Автозаполнено {auto_filled} "
+                                    f"сиблингов в группе '{group.name}' "
+                                    f"(actual = stock)")
+                                # Обновляем UI для всех детей группы
+                                self._refresh_group_children(parent, group)
+                
+                self._update_parent_group(item)
+                
             elif data["type"] == "group":
                 group_name = data["group_name"]
                 group = self._find_group_by_name(group_name)
                 if not group: return
+                
                 if not text:
                     for p in group.products:
                         p.actual = None
-                        if p.id in current_session.actuals_cache: del current_session.actuals_cache[p.id]
+                        if p.id in current_session.actuals_cache:
+                            del current_session.actuals_cache[p.id]
                 else:
                     try:
                         group_actual = int(float(text))
                         group.distribute_actual(group_actual)
-                        for p in group.products: self._save_to_cache(p)
+                        for p in group.products:
+                            self._save_to_cache(p)
                     except ValueError:
                         previous = str(group.total_actual) if group.total_actual is not None else ""
-                        self.table.blockSignals(True); item.setText(2, previous); self.table.blockSignals(False); return
-                self._refresh_group_children(item, group); self._update_group_item_display(item, group)
-            self._update_status_stats(); self._update_mood()
-        finally: self._updating = False
+                        self.table.blockSignals(True)
+                        item.setText(2, previous)
+                        self.table.blockSignals(False)
+                        return
+                
+                self._refresh_group_children(item, group)
+                self._update_group_item_display(item, group)
+            
+            self._update_status_stats()
+            self._update_mood()
+        finally:
+            self._updating = False
 
     def _update_product_item_display(self, item: QTreeWidgetItem, product: Product):
         item.setText(3, str(product.actual - product.stock) if product.actual is not None else "")
