@@ -1065,12 +1065,48 @@ function onItemInput(pid, value, groupName, inputElement) {
     if (value === '' || value === null) {
         delete itemUpdates[pid]; delete manualItemUpdates[pid];
         inputElement.className = 'item-input';
-        if (activeInput === inputElement) inputElement.classList.add('active-field');
     } else {
         var num = parseInt(value);
         if (!isNaN(num)) {
             itemUpdates[pid] = num; manualItemUpdates[pid] = num;
             applyItemStyles(inputElement, num, findGroup(groupName));
+            
+            // 🆕 АВТОЗАПОЛНЕНИЕ СИБЛИНГОВ В ГРУППЕ
+            var group = findGroup(groupName);
+            if (group && group.products) {
+                var autoFilled = 0;
+                for (var i = 0; i < group.products.length; i++) {
+                    var p = group.products[i];
+                    // Пропускаем сам редактируемый товар
+                    if (p.id === pid) continue;
+                    // Пропускаем уже заполненные товары
+                    if (itemUpdates[p.id] !== undefined) continue;
+                    
+                    // Автозаполнение: actual = stock (сходится)
+                    itemUpdates[p.id] = p.stock;
+                    manualItemUpdates[p.id] = p.stock;
+                    autoFilled++;
+                    
+                    // Обновляем UI для этого сиблинга
+                    var siblingInput = document.querySelector(
+                        '.item-input[data-pid="' + p.id + '"]'
+                    );
+                    if (siblingInput) {
+                        siblingInput.value = p.stock;
+                        applyItemStyles(siblingInput, p.stock, group);
+                    }
+                }
+                if (autoFilled > 0) {
+                    addLog('✓ Автозаполнено ' + autoFilled + ' сиблингов в группе ' + groupName, 'ok');
+                    // Автоматически разворачиваем группу чтобы увидеть результат
+                    var sid = safeId(groupName);
+                    if (!expandedGroups[sid]) {
+                        expandedGroups[sid] = true;
+                        var container = document.getElementById('items_' + sid);
+                        if (container) container.classList.add('open');
+                    }
+                }
+            }
         }
     }
     updateGroupDisplay(groupName); updateSyncButton();
@@ -1174,23 +1210,38 @@ function updateSyncButton() {
 
 function syncData() {
     var itemUpdatesToSend = {};
-    for (var pid in manualItemUpdates) itemUpdatesToSend[pid] = manualItemUpdates[pid];
+    // 🆕 Отправляем ВСЕ заполненные товары (включая автозаполненные)
+    for (var pid in itemUpdates) {
+        itemUpdatesToSend[pid] = itemUpdates[pid];
+    }
+    
     var groupUpdates = {}, touchedGroups = {};
-    for (var pid in manualItemUpdates) { var g = findGroupByProductId(parseInt(pid)); if (g) touchedGroups[g.name] = true; }
-    for (var pid in itemUpdates) { var g = findGroupByProductId(parseInt(pid)); if (g) touchedGroups[g.name] = true; }
-    for (var gn in touchedGroups) { var g = findGroup(gn); var total = getGroupTotal(g); if (total !== null) groupUpdates[gn] = total; }
+    for (var pid in itemUpdates) { 
+        var g = findGroupByProductId(parseInt(pid)); 
+        if (g) touchedGroups[g.name] = true; 
+    }
+    for (var gn in touchedGroups) { 
+        var g = findGroup(gn); 
+        var total = getGroupTotal(g); 
+        if (total !== null) groupUpdates[gn] = total; 
+    }
+    
     var singleUpdatesToSend = {};
     for (var pid in singleUpdates) singleUpdatesToSend[pid] = singleUpdates[pid];
+    
     addLog('═══════════════════════════════', 'warn');
     addLog('📤 ОТПРАВКА:', 'warn');
     addLog('  Групп: ' + Object.keys(groupUpdates).length, 'info');
-    addLog('  Ручных вкусов: ' + Object.keys(itemUpdatesToSend).length, 'info');
+    addLog('  Товаров (все): ' + Object.keys(itemUpdatesToSend).length, 'info');
     addLog('  Одиночных: ' + Object.keys(singleUpdatesToSend).length, 'info');
     addLog('═══════════════════════════════', 'warn');
+    
     var btn = document.getElementById('syncBtn');
     btn.disabled = true; btn.textContent = '⏳ Отправка...';
+    
     fetch('/api/update_all', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
+        method: 'POST', 
+        headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             group_updates: groupUpdates,
             item_updates: itemUpdatesToSend,
@@ -1199,7 +1250,7 @@ function syncData() {
     })
     .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
     .then(function(d) {
-        addLog('✓ Принято: ' + d.pending_groups + ' групп, ' + d.pending_items + ' вкусов, ' + d.pending_singles + ' одиночных', 'ok');
+        addLog('✓ Принято: ' + d.pending_groups + ' групп, ' + d.pending_items + ' товаров, ' + d.pending_singles + ' одиночных', 'ok');
         btn.disabled = false; updateSyncButton();
     })
     .catch(function(e) {
