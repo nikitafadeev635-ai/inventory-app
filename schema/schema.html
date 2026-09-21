@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>CyberMG — Архитектура проекта</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', 'Inter', sans-serif;
+    background: #0a0e1a;
+    color: #e4e7eb;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  .container { max-width: 1400px; margin: 0 auto; }
+  h1 {
+    text-align: center;
+    font-size: 32px;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, #2C87FD 0%, #9b5cf6 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    text-align: center;
+    color: #8b95a7;
+    margin-bottom: 32px;
+    font-size: 14px;
+  }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 24px;
+    border-bottom: 2px solid #1f2937;
+  }
+  .tab {
+    padding: 12px 24px;
+    cursor: pointer;
+    background: transparent;
+    color: #8b95a7;
+    border: none;
+    font-size: 15px;
+    font-weight: 500;
+    border-bottom: 3px solid transparent;
+    transition: all 0.2s;
+  }
+  .tab:hover { color: #e4e7eb; }
+  .tab.active {
+    color: #2C87FD;
+    border-bottom-color: #2C87FD;
+  }
+  .content {
+    background: #131826;
+    border-radius: 12px;
+    padding: 32px;
+    border: 1px solid #1f2937;
+    min-height: 700px;
+  }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  h2 {
+    color: #2C87FD;
+    margin-bottom: 16px;
+    font-size: 22px;
+  }
+  h3 {
+    color: #e4e7eb;
+    margin: 24px 0 12px 0;
+    font-size: 17px;
+    padding-left: 12px;
+    border-left: 3px solid #2C87FD;
+  }
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin: 16px 0;
+    padding: 12px;
+    background: #0a0e1a;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; }
+  .legend-color {
+    width: 16px; height: 16px; border-radius: 4px;
+  }
+  svg { max-width: 100%; height: auto; }
+  .node rect { stroke-width: 2; }
+  .node text { font-family: 'Segoe UI', sans-serif; font-size: 12px; }
+  .arrow { fill: none; stroke: #4b5563; stroke-width: 1.5; marker-end: url(#arrow); }
+  .arrow-http { stroke: #2C87FD; stroke-width: 2; stroke-dasharray: 5,3; }
+  .arrow-data { stroke: #10b981; stroke-width: 1.5; }
+  .arrow-legacy { stroke: #6b7280; stroke-width: 1; stroke-dasharray: 2,2; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid #1f2937;
+  }
+  th {
+    background: #1a2133;
+    color: #2C87FD;
+    font-weight: 600;
+  }
+  tr:hover td { background: #1a2133; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge-new { background: #2C87FD33; color: #2C87FD; }
+  .badge-core { background: #10b98133; color: #10b981; }
+  .badge-gui { background: #9b5cf633; color: #9b5cf6; }
+  .badge-legacy { background: #6b728033; color: #9ca3af; }
+  .code {
+    font-family: 'Consolas', monospace;
+    background: #0a0e1a;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+    color: #fbbf24;
+  }
+  .idef0-box {
+    fill: #1a2133;
+    stroke: #2C87FD;
+    stroke-width: 2;
+  }
+  .idef0-label {
+    fill: #8b95a7;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .idef0-text {
+    fill: #e4e7eb;
+    font-size: 13px;
+  }
+  .idef0-flow {
+    fill: none;
+    stroke-width: 2;
+    marker-end: url(#arrow);
+  }
+  .flow-input { stroke: #10b981; }
+  .flow-output { stroke: #f59e0b; }
+  .flow-control { stroke: #ef4444; stroke-dasharray: 5,3; }
+  .flow-mechanism { stroke: #8b5cf6; stroke-dasharray: 3,2; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🏗️ CyberMG — Архитектура проекта</h1>
+  <p class="subtitle">Система инвентаризации с серверным прокси к SmartShell API</p>
+
+  <div class="tabs">
+    <button class="tab active" onclick="showPanel('structure')">📁 Структура проекта</button>
+    <button class="tab" onclick="showPanel('modules')">🔗 Связи модулей</button>
+    <button class="tab" onclick="showPanel('idef0')">📐 Схема IDEF0</button>
+    <button class="tab" onclick="showPanel('flow')">⚡ Поток данных</button>
+  </div>
+
+  <div class="content">
+
+    <!-- ============ СТРУКТУРА ПРОЕКТА ============ -->
+    <div class="panel active" id="structure">
+      <h2>📁 Структура файлов и папок</h2>
+
+      <div class="legend">
+        <div class="legend-item"><span class="legend-color" style="background:#2C87FD"></span>Точка входа</div>
+        <div class="legend-item"><span class="legend-color" style="background:#10b981"></span>Ядро (core)</div>
+        <div class="legend-item"><span class="legend-color" style="background:#9b5cf6"></span>GUI</div>
+        <div class="legend-item"><span class="legend-color" style="background:#f59e0b"></span>Модели данных</div>
+        <div class="legend-item"><span class="legend-color" style="background:#ef4444"></span>Сервер (VPS)</div>
+        <div class="legend-item"><span class="legend-color" style="background:#6b7280"></span>Legacy</div>
+      </div>
+
+      <svg viewBox="0 0 1200 1000" xmlns="http://www.w3.org/2000/svg">
+        <!-- Клиентская часть -->
+        <text x="40" y="30" fill="#2C87FD" font-size="18" font-weight="bold">💻 КЛИЕНТ (Windows, PyQt6)</text>
+        <rect x="20" y="40" width="560" height="700" rx="12" fill="#0a0e1a" stroke="#1f2937" stroke-width="2"/>
+
+        <!-- main.py -->
+        <g class="node">
+          <rect x="50" y="70" width="200" height="40" rx="6" fill="#2C87FD" stroke="#1e40af"/>
+          <text x="150" y="95" text-anchor="middle" fill="white" font-weight="bold">main.py (точка входа)</text>
+        </g>
+
+        <!-- config.py -->
+        <g class="node">
+          <rect x="280" y="70" width="200" height="40" rx="6" fill="#1e40af" stroke="#1e3a8a"/>
+          <text x="380" y="95" text-anchor="middle" fill="white" font-weight="bold">config.py</text>
+        </g>
+
+        <!-- .env -->
+        <g class="node">
+          <rect x="50" y="130" width="200" height="40" rx="6" fill="#374151" stroke="#1f2937"/>
+          <text x="150" y="155" text-anchor="middle" fill="#9ca3af">.env (PROXY_SERVER_URL)</text>
+        </g>
+
+        <!-- Core -->
+        <text x="50" y="200" fill="#10b981" font-size="14" font-weight="bold">core/</text>
+        <g class="node">
+          <rect x="50" y="210" width="230" height="35" rx="6" fill="#10b981" stroke="#065f46"/>
+          <text x="165" y="232" text-anchor="middle" fill="white">api_client.py ⭐</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="210" width="230" height="35" rx="6" fill="#10b981" stroke="#065f46"/>
+          <text x="405" y="232" text-anchor="middle" fill="white">normalization.py</text>
+        </g>
+        <g class="node">
+          <rect x="50" y="255" width="230" height="35" rx="6" fill="#10b981" stroke="#065f46"/>
+          <text x="165" y="277" text-anchor="middle" fill="white">goods_cache.py 🆕</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="255" width="230" height="35" rx="6" fill="#10b981" stroke="#065f46"/>
+          <text x="405" y="277" text-anchor="middle" fill="white">session.py</text>
+        </g>
+        <g class="node">
+          <rect x="50" y="300" width="230" height="35" rx="6" fill="#10b981" stroke="#065f46"/>
+          <text x="165" y="322" text-anchor="middle" fill="white">paths.py 🆕</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="300" width="230" height="35" rx="6" fill="#10b981" stroke="#065f46"/>
+          <text x="405" y="322" text-anchor="middle" fill="white">report_generator.py</text>
+        </g>
+        <g class="node" opacity="0.5">
+          <rect x="50" y="345" width="230" height="35" rx="6" fill="#6b7280" stroke="#374151"/>
+          <text x="165" y="367" text-anchor="middle" fill="#d1d5db">smartshell_client.py (legacy)</text>
+        </g>
+        <g class="node" opacity="0.5">
+          <rect x="290" y="345" width="230" height="35" rx="6" fill="#6b7280" stroke="#374151"/>
+          <text x="405" y="367" text-anchor="middle" fill="#d1d5db">database.py (legacy)</text>
+        </g>
+
+        <!-- GUI -->
+        <text x="50" y="410" fill="#9b5cf6" font-size="14" font-weight="bold">gui/</text>
+        <g class="node">
+          <rect x="50" y="420" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="165" y="442" text-anchor="middle" fill="white">main_window.py</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="420" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="405" y="442" text-anchor="middle" fill="white">inventory_window.py</text>
+        </g>
+        <g class="node">
+          <rect x="50" y="465" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="165" y="487" text-anchor="middle" fill="white">handover_dialog.py</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="465" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="405" y="487" text-anchor="middle" fill="white">login_widget.py</text>
+        </g>
+        <g class="node">
+          <rect x="50" y="510" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="165" y="532" text-anchor="middle" fill="white">normalization_dialog.py</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="510" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="405" y="532" text-anchor="middle" fill="white">themes.py</text>
+        </g>
+        <g class="node">
+          <rect x="50" y="555" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="165" y="577" text-anchor="middle" fill="white">theme_dialog.py</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="555" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="405" y="577" text-anchor="middle" fill="white">inventory_customizer.py</text>
+        </g>
+        <g class="node">
+          <rect x="50" y="600" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="165" y="622" text-anchor="middle" fill="white">styles.py</text>
+        </g>
+        <g class="node">
+          <rect x="290" y="600" width="230" height="35" rx="6" fill="#9b5cf6" stroke="#6d28d9"/>
+          <text x="405" y="622" text-anchor="middle" fill="white">gif_background.py</text>
+        </g>
+
+        <!-- items -->
+        <text x="50" y="665" fill="#f59e0b" font-size="14" font-weight="bold">items/</text>
+        <g class="node">
+          <rect x="50" y="675" width="230" height="35" rx="6" fill="#f59e0b" stroke="#b45309"/>
+          <text x="165" y="697" text-anchor="middle" fill="white">product.py</text>
+        </g>
+
+        <!-- User themes -->
+        <text x="50" y="725" fill="#ec4899" font-size="14" font-weight="bold">user_themes/ (данные)</text>
+        <g class="node">
+          <rect x="50" y="735" width="480" height="35" rx="6" fill="#ec489933" stroke="#ec4899"/>
+          <text x="290" y="757" text-anchor="middle" fill="#ec4899">themes/*.json + images/*.gif (AppData или рядом с exe)</text>
+        </g>
+
+        <!-- СЕРВЕРНАЯ ЧАСТЬ -->
+        <text x="640" y="30" fill="#ef4444" font-size="18" font-weight="bold">🖥️ СЕРВЕР (VPS 78.17.47.74)</text>
+        <rect x="620" y="40" width="560" height="450" rx="12" fill="#0a0e1a" stroke="#ef4444" stroke-width="2"/>
+
+        <g class="node">
+          <rect x="650" y="70" width="250" height="45" rx="6" fill="#ef4444" stroke="#991b1b"/>
+          <text x="775" y="90" text-anchor="middle" fill="white" font-weight="bold">main.py (FastAPI)</text>
+          <text x="775" y="105" text-anchor="middle" fill="#fecaca" font-size="11">uvicorn + SSL (port 8443)</text>
+        </g>
+
+        <g class="node">
+          <rect x="650" y="135" width="250" height="35" rx="6" fill="#7f1d1d" stroke="#991b1b"/>
+          <text x="775" y="157" text-anchor="middle" fill="#fecaca">.env (мастер-кредами, JWT)</text>
+        </g>
+
+        <g class="node">
+          <rect x="650" y="180" width="250" height="35" rx="6" fill="#7f1d1d" stroke="#991b1b"/>
+          <text x="775" y="202" text-anchor="middle" fill="#fecaca">certs/server.{key,crt}</text>
+        </g>
+
+        <g class="node">
+          <rect x="650" y="225" width="250" height="35" rx="6" fill="#7f1d1d" stroke="#991b1b"/>
+          <text x="775" y="247" text-anchor="middle" fill="#fecaca">logs/server.log</text>
+        </g>
+
+        <text x="650" y="290" fill="#fbbf24" font-size="13" font-weight="bold">Endpoints:</text>
+        <text x="660" y="310" fill="#e4e7eb" font-size="12" font-family="monospace">POST /api/auth/login</text>
+        <text x="660" y="328" fill="#e4e7eb" font-size="12" font-family="monospace">GET  /api/goods/list</text>
+        <text x="660" y="346" fill="#e4e7eb" font-size="12" font-family="monospace">POST /api/normalize/single ⭐</text>
+        <text x="660" y="364" fill="#e4e7eb" font-size="12" font-family="monospace">POST /api/employees/search</text>
+        <text x="660" y="382" fill="#9ca3af" font-size="12" font-family="monospace">POST /api/normalize (legacy)</text>
+
+        <text x="650" y="415" fill="#fbbf24" font-size="13" font-weight="bold">Технологии:</text>
+        <text x="660" y="435" fill="#e4e7eb" font-size="12">FastAPI · PyJWT · httpx · pymysql · uvicorn</text>
+        <text x="660" y="455" fill="#e4e7eb" font-size="12">systemd · UFW · fail2ban · self-signed SSL</text>
+
+        <!-- ВНЕШНИЕ СИСТЕМЫ -->
+        <text x="640" y="520" fill="#06b6d4" font-size="18" font-weight="bold">🌐 ВНЕШНИЕ СИСТЕМЫ</text>
+        <rect x="620" y="530" width="560" height="210" rx="12" fill="#0a0e1a" stroke="#0891b2" stroke-width="2"/>
+
+        <g class="node">
+          <rect x="650" y="560" width="240" height="60" rx="6" fill="#0891b2" stroke="#155e75"/>
+          <text x="770" y="585" text-anchor="middle" fill="white" font-weight="bold">SmartShell API</text>
+          <text x="770" y="605" text-anchor="middle" fill="#cffafe" font-size="11">billing.smartshell.gg</text>
+        </g>
+
+        <g class="node">
+          <rect x="920" y="560" width="240" height="60" rx="6" fill="#0891b2" stroke="#155e75"/>
+          <text x="1040" y="585" text-anchor="middle" fill="white" font-weight="bold">MySQL (Timeweb)</text>
+          <text x="1040" y="605" text-anchor="middle" fill="#cffafe" font-size="11">vh454.timeweb.ru:3306</text>
+        </g>
+
+        <text x="660" y="655" fill="#fbbf24" font-size="12" font-weight="bold">Таблицы БД:</text>
+        <text x="670" y="675" fill="#e4e7eb" font-size="11" font-family="monospace">• employees (faname, password)</text>
+        <text x="670" y="692" fill="#e4e7eb" font-size="11" font-family="monospace">• audit_log (+details JSON) 🆕</text>
+        <text x="670" y="709" fill="#9ca3af" font-size="11" font-family="monospace">• products (legacy, не используется)</text>
+        <text x="670" y="726" fill="#9ca3af" font-size="11" font-family="monospace">• inventory_operations (legacy)</text>
+
+        <!-- Сборка -->
+        <text x="40" y="800" fill="#fbbf24" font-size="18" font-weight="bold">📦 Артефакты сборки</text>
+        <rect x="20" y="810" width="1160" height="160" rx="12" fill="#0a0e1a" stroke="#b45309" stroke-width="2"/>
+
+        <g class="node">
+          <rect x="50" y="840" width="220" height="50" rx="6" fill="#b45309" stroke="#78350f"/>
+          <text x="160" y="860" text-anchor="middle" fill="white" font-weight="bold">dist/CyberMG.exe</text>
+          <text x="160" y="878" text-anchor="middle" fill="#fef3c7" font-size="11">PyInstaller · ~80 MB</text>
+        </g>
+
+        <g class="node">
+          <rect x="290" y="840" width="220" height="50" rx="6" fill="#b45309" stroke="#78350f"/>
+          <text x="400" y="860" text-anchor="middle" fill="white" font-weight="bold">background.gif</text>
+          <text x="400" y="878" text-anchor="middle" fill="#fef3c7" font-size="11">bundled через --add-data</text>
+        </g>
+
+        <g class="node">
+          <rect x="530" y="840" width="220" height="50" rx="6" fill="#b45309" stroke="#78350f"/>
+          <text x="640" y="860" text-anchor="middle" fill="white" font-weight="bold">image/</text>
+          <text x="640" y="878" text-anchor="middle" fill="#fef3c7" font-size="11">bundled resources</text>
+        </g>
+
+        <g class="node">
+          <rect x="770" y="840" width="220" height="50" rx="6" fill="#b45309" stroke="#78350f"/>
+          <text x="880" y="860" text-anchor="middle" fill="white" font-weight="bold">gui/themes/</text>
+          <text x="880" y="878" text-anchor="middle" fill="#fef3c7" font-size="11">built-in темы (read-only)</text>
+        </g>
+
+        <g class="node">
+          <rect x="50" y="905" width="940" height="45" rx="6" fill="#78350f" stroke="#451a03"/>
+          <text x="520" y="932" text-anchor="middle" fill="#fef3c7">user_themes/ — пользовательские темы (создаётся рядом с exe, не bundled)</text>
+        </g>
+      </svg>
+
+      <h3>📊 Статистика проекта</h3>
+      <table>
+        <tr><th>Категория</th><th>Файлов</th><th>Описание</th></tr>
+        <tr><td>Точка входа</td><td>1</td><td><span class="code">main.py</span></td></tr>
+        <tr><td><span class="badge badge-core">core/</span></td><td>8</td><td>Бизнес-логика, клиенты, кеш, отчёты</td></tr>
+        <tr><td><span class="badge badge-gui">gui/</span></td><td>10</td><td>PyQt6 виджеты, диалоги, темы</td></tr>
+        <tr><td><span class="badge badge-new">items/</span></td><td>1</td><td>Модель Product</td></tr>
+        <tr><td><span class="badge badge-legacy">legacy</span></td><td>2</td><td>Прямой доступ к SmartShell и БД</td></tr>
+        <tr><td>Сервер (VPS)</td><td>1</td><td>FastAPI-прокси на 78.17.47.74</td></tr>
+      </table>
+    </div>
+
+    <!-- ============ СВЯЗИ МОДУЛЕЙ ============ -->
+    <div class="panel" id="modules">
+      <h2>🔗 Связи между модулями</h2>
+
+      <div class="legend">
+        <div class="legend-item"><span class="legend-color" style="background:#2C87FD"></span>HTTP запрос (HTTPS)</div>
+        <div class="legend-item"><span class="legend-color" style="background:#10b981"></span>Передача данных</div>
+        <div class="legend-item"><span class="legend-color" style="background:#6b7280"></span>Legacy (не используется)</div>
+        <div class="legend-item"><span class="legend-color" style="background:#9b5cf6"></span>Импорт модулей</div>
+      </div>
+
+      <svg viewBox="0 0 1300 900" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b5563"/>
+          </marker>
+          <marker id="arrow-http" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#2C87FD"/>
+          </marker>
+          <marker id="arrow-data" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <!-- Клиентский блок -->
+        <rect x="20" y="20" width="620" height="860" rx="12" fill="#0a0e1a" stroke="#2C87FD" stroke-width="2"/>
+        <text x="40" y="45" fill="#2C87FD" font-size="16" font-weight="bold">💻 Клиент (PyQt6 приложение)</text>
+
+        <!-- main.py -->
+        <g class="node">
+          <rect x="50" y="70" width="250" height="50" rx="6" fill="#2C87FD" stroke="#1e40af" stroke-width="2"/>
+          <text x="175" y="92" text-anchor="middle" fill="white" font-weight="bold">main.py</text>
+          <text x="175" y="108" text-anchor="middle" fill="#dbeafe" font-size="11">QApplication → MainWindow</text>
+        </g>
+
+        <!-- ApiClient -->
+        <g class="node">
+          <rect x="50" y="150" width="250" height="70" rx="6" fill="#10b981" stroke="#065f46" stroke-width="2"/>
+          <text x="175" y="172" text-anchor="middle" fill="white" font-weight="bold">core/api_client.py</text>
+          <text x="175" y="190" text-anchor="middle" fill="#d1fae5" font-size="11">login() · fetch_goods()</text>
+          <text x="175" y="205" text-anchor="middle" fill="#d1fae5" font-size="11">search_employees() · normalize_single()</text>
+        </g>
+
+        <!-- MainWindow -->
+        <g class="node">
+          <rect x="350" y="150" width="250" height="50" rx="6" fill="#9b5cf6" stroke="#6d28d9" stroke-width="2"/>
+          <text x="475" y="172" text-anchor="middle" fill="white" font-weight="bold">gui/main_window.py</text>
+          <text x="475" y="190" text-anchor="middle" fill="#ede9fe" font-size="11">MainWindow</text>
+        </g>
+
+        <!-- HandoverDialog -->
+        <g class="node">
+          <rect x="350" y="230" width="250" height="50" rx="6" fill="#9b5cf6" stroke="#6d28d9" stroke-width="2"/>
+          <text x="475" y="252" text-anchor="middle" fill="white" font-weight="bold">gui/handover_dialog.py</text>
+          <text x="475" y="270" text-anchor="middle" fill="#ede9fe" font-size="11">HandoverDialog (client)</text>
+        </g>
+
+        <!-- LoginWidget -->
+        <g class="node">
+          <rect x="350" y="310" width="250" height="50" rx="6" fill="#9b5cf6" stroke="#6d28d9" stroke-width="2"/>
+          <text x="475" y="332" text-anchor="middle" fill="white" font-weight="bold">gui/login_widget.py</text>
+          <text x="475" y="350" text-anchor="middle" fill="#ede9fe" font-size="11">QCompleter + search_employees()</text>
+        </g>
+
+        <!-- InventoryWindow -->
+        <g class="node">
+          <rect x="350" y="390" width="250" height="50" rx="6" fill="#9b5cf6" stroke="#6d28d9" stroke-width="2"/>
+          <text x="475" y="412" text-anchor="middle" fill="white" font-weight="bold">gui/inventory_window.py</text>
+          <text x="475" y="430" text-anchor="middle" fill="#ede9fe" font-size="11">Таблица + фильтры + поиск</text>
+        </g>
+
+        <!-- GoodsCache -->
+        <g class="node">
+          <rect x="50" y="250" width="250" height="60" rx="6" fill="#f59e0b" stroke="#b45309" stroke-width="2"/>
+          <text x="175" y="272" text-anchor="middle" fill="white" font-weight="bold">core/goods_cache.py</text>
+          <text x="175" y="290" text-anchor="middle" fill="#fef3c7" font-size="11">Singleton · filter_local()</text>
+        </g>
+
+        <!-- Session -->
+        <g class="node">
+          <rect x="50" y="340" width="250" height="50" rx="6" fill="#10b981" stroke="#065f46" stroke-width="2"/>
+          <text x="175" y="362" text-anchor="middle" fill="white" font-weight="bold">core/session.py</text>
+          <text x="175" y="380" text-anchor="middle" fill="#d1fae5" font-size="11">current_session (JWT, giver, ...)</text>
+        </g>
+
+        <!-- NormalizationService -->
+        <g class="node">
+          <rect x="50" y="420" width="250" height="60" rx="6" fill="#10b981" stroke="#065f46" stroke-width="2"/>
+          <text x="175" y="442" text-anchor="middle" fill="white" font-weight="bold">core/normalization.py</text>
+          <text x="175" y="460" text-anchor="middle" fill="#d1fae5" font-size="11">NormalizationService</text>
+        </g>
+
+        <!-- NormalizationDialog -->
+        <g class="node">
+          <rect x="350" y="470" width="250" height="50" rx="6" fill="#9b5cf6" stroke="#6d28d9" stroke-width="2"/>
+          <text x="475" y="492" text-anchor="middle" fill="white" font-weight="bold">gui/normalization_dialog.py</text>
+          <text x="475" y="510" text-anchor="middle" fill="#ede9fe" font-size="11">NormalizationWorker (QThread)</text>
+        </g>
+
+        <!-- ReportGenerator -->
+        <g class="node">
+          <rect x="50" y="510" width="250" height="50" rx="6" fill="#10b981" stroke="#065f46" stroke-width="2"/>
+          <text x="175" y="532" text-anchor="middle" fill="white" font-weight="bold">core/report_generator.py</text>
+          <text x="175" y="550" text-anchor="middle" fill="#d1fae5" font-size="11">PDF отчёт (fpdf2)</text>
+        </g>
+
+        <!-- Themes -->
+        <g class="node">
+          <rect x="350" y="550" width="250" height="50" rx="6" fill="#ec4899" stroke="#be185d" stroke-width="2"/>
+          <text x="475" y="572" text-anchor="middle" fill="white" font-weight="bold">gui/themes.py</text>
+          <text x="475" y="590" text-anchor="middle" fill="#fce7f3" font-size="11">theme_manager · загрузка/сохранение</text>
+        </g>
+
+        <!-- Paths -->
+        <g class="node">
+          <rect x="50" y="590" width="250" height="50" rx="6" fill="#ec4899" stroke="#be185d" stroke-width="2"/>
+          <text x="175" y="612" text-anchor="middle" fill="white" font-weight="bold">core/paths.py</text>
+          <text x="175" y="630" text-anchor="middle" fill="#fce7f3" font-size="11">get_user_themes_dir() · dev vs exe</text>
+        </g>
+
+        <!-- Product -->
+        <g class="node">
+          <rect x="50" y="670" width="250" height="50" rx="6" fill="#f59e0b" stroke="#b45309" stroke-width="2"/>
+          <text x="175" y="692" text-anchor="middle" fill="white" font-weight="bold">items/product.py</text>
+          <text x="175" y="710" text-anchor="middle" fill="#fef3c7" font-size="11">Product.from_api()</text>
+        </g>
+
+        <!-- Config -->
+        <g class="node">
+          <rect x="350" y="670" width="250" height="50" rx="6" fill="#6b7280" stroke="#374151" stroke-width="2"/>
+          <text x="475" y="692" text-anchor="middle" fill="white" font-weight="bold">config.py</text>
+          <text x="475" y="710" text-anchor="middle" fill="#e5e7eb" font-size="11">URLs · WAREHOUSE_IDS · лимиты</text>
+        </g>
+
+        <!-- Legacy -->
+        <g class="node" opacity="0.4">
+          <rect x="50" y="750" width="550" height="50" rx="6" fill="#6b7280" stroke="#374151" stroke-width="2" stroke-dasharray="4,2"/>
+          <text x="325" y="772" text-anchor="middle" fill="#9ca3af" font-weight="bold">⚠️ Legacy (НЕ используются): smartshell_client.py · database.py</text>
+          <text x="325" y="790" text-anchor="middle" fill="#9ca3af" font-size="11">Оставлены для обратной совместимости — весь трафик идёт через api_client</text>
+        </g>
+
+        <!-- Серверный блок -->
+        <rect x="680" y="20" width="600" height="480" rx="12" fill="#0a0e1a" stroke="#ef4444" stroke-width="2"/>
+        <text x="700" y="45" fill="#ef4444" font-size="16" font-weight="bold">🖥️ Сервер (VPS — FastAPI)</text>
+
+        <!-- FastAPI -->
+        <g class="node">
+          <rect x="710" y="70" width="250" height="70" rx="6" fill="#ef4444" stroke="#991b1b" stroke-width="2"/>
+          <text x="835" y="92" text-anchor="middle" fill="white" font-weight="bold">FastAPI приложение</text>
+          <text x="835" y="110" text-anchor="middle" fill="#fecaca" font-size="11">@app.post("/api/auth/login")</text>
+          <text x="835" y="125" text-anchor="middle" fill="#fecaca" font-size="11">@app.post("/api/normalize/single")</text>
+        </g>
+
+        <!-- JWT -->
+        <g class="node">
+          <rect x="710" y="170" width="250" height="50" rx="6" fill="#7f1d1d" stroke="#991b1b" stroke-width="2"/>
+          <text x="835" y="192" text-anchor="middle" fill="white" font-weight="bold">JWT авторизация</text>
+          <text x="835" y="210" text-anchor="middle" fill="#fecaca" font-size="11">create_jwt_token() · get_current_user()</text>
+        </g>
+
+        <!-- SmartShellProxy -->
+        <g class="node">
+          <rect x="710" y="250" width="250" height="60" rx="6" fill="#7f1d1d" stroke="#991b1b" stroke-width="2"/>
+          <text x="835" y="272" text-anchor="middle" fill="white" font-weight="bold">SmartShell Proxy</text>
+          <text x="835" y="290" text-anchor="middle" fill="#fecaca" font-size="11">fetch_goods_from_ss() · change_quantity_ss()</text>
+        </g>
+
+        <!-- AuditLogger -->
+        <g class="node">
+          <rect x="710" y="340" width="250" height="60" rx="6" fill="#7f1d1d" stroke="#991b1b" stroke-width="2"/>
+          <text x="835" y="362" text-anchor="middle" fill="white" font-weight="bold">Audit Logger</text>
+          <text x="835" y="380" text-anchor="middle" fill="#fecaca" font-size="11">log_audit() · details JSON</text>
+        </g>
+
+        <!-- TokenCache -->
+        <g class="node">
+          <rect x="710" y="430" width="250" height="50" rx="6" fill="#7f1d1d" stroke="#991b1b" stroke-width="2"/>
+          <text x="835" y="452" text-anchor="middle" fill="white" font-weight="bold">Token Cache (1h TTL)</text>
+          <text x="835" y="470" text-anchor="middle" fill="#fecaca" font-size="11">_ss_token_cache</text>
+        </g>
+
+        <!-- MySQL -->
+        <g class="node">
+          <rect x="1000" y="150" width="250" height="70" rx="6" fill="#0891b2" stroke="#155e75" stroke-width="2"/>
+          <text x="1125" y="172" text-anchor="middle" fill="white" font-weight="bold">MySQL (Timeweb)</text>
+          <text x="1125" y="190" text-anchor="middle" fill="#cffafe" font-size="11">employees · audit_log</text>
+          <text x="1125" y="205" text-anchor="middle" fill="#cffafe" font-size="11">vh454.timeweb.ru:3306</text>
+        </g>
+
+        <!-- SmartShell -->
+        <g class="node">
+          <rect x="1000" y="280" width="250" height="70" rx="6" fill="#0891b2" stroke="#155e75" stroke-width="2"/>
+          <text x="1125" y="302" text-anchor="middle" fill="white" font-weight="bold">SmartShell API</text>
+          <text x="1125" y="320" text-anchor="middle" fill="#cffafe" font-size="11">GraphQL endpoint</text>
+          <text x="1125" y="335" text-anchor="middle" fill="#cffafe" font-size="11">billing.smartshell.gg</text>
+        </g>
+
+        <!-- СТРЕЛКИ: импорты и вызовы -->
+        <!-- main → MainWindow -->
+        <path class="arrow" d="M 300 95 L 350 175" marker-end="url(#arrow)"/>
+        <!-- main → ApiClient -->
+        <path class="arrow" d="M 175 120 L 175 150" marker-end="url(#arrow)"/>
+        <!-- MainWindow → HandoverDialog -->
+        <path class="arrow" d="M 475 200 L 475 230" marker-end="url(#arrow)"/>
+        <!-- HandoverDialog → LoginWidget -->
+        <path class="arrow" d="M 475 280 L 475 310" marker-end="url(#arrow)"/>
+        <!-- MainWindow → InventoryWindow -->
+        <path class="arrow" d="M 475 200 L 530 390" marker-end="url(#arrow)"/>
+        <!-- InventoryWindow → GoodsCache -->
+        <path class="arrow-data" d="M 350 415 L 300 280" marker-end="url(#arrow-data)" fill="none" stroke="#10b981" stroke-width="2"/>
+        <!-- InventoryWindow → NormalizationService -->
+        <path class="arrow" d="M 350 415 L 300 450" marker-end="url(#arrow)"/>
+        <!-- InventoryWindow → NormalizationDialog -->
+        <path class="arrow" d="M 475 440 L 475 470" marker-end="url(#arrow)"/>
+        <!-- NormalizationDialog → NormalizationService -->
+        <path class="arrow" d="M 350 495 L 300 450" marker-end="url(#arrow)"/>
+        <!-- NormalizationService → ApiClient -->
+        <path class="arrow" d="M 175 420 L 175 220" marker-end="url(#arrow)"/>
+        <!-- ApiClient → Session -->
+        <path class="arrow" d="M 175 220 L 175 340" marker-end="url(#arrow)"/>
+        <!-- LoginWidget → ApiClient (search_employees) -->
+        <path class="arrow-http" d="M 350 335 L 300 195" marker-end="url(#arrow-http)" fill="none" stroke="#2C87FD" stroke-width="2"/>
+        <!-- themes → paths -->
+        <path class="arrow" d="M 350 575 L 300 615" marker-end="url(#arrow)"/>
+        <!-- InventoryWindow → Product -->
+        <path class="arrow" d="M 450 440 L 200 670" marker-end="url(#arrow)"/>
+
+        <!-- HTTP КЛИЕНТ → СЕРВЕР -->
+        <path d="M 300 185 L 710 105" fill="none" stroke="#2C87FD" stroke-width="3" stroke-dasharray="8,4" marker-end="url(#arrow-http)"/>
+        <text x="505" y="130" fill="#2C87FD" font-size="12" font-weight="bold" text-anchor="middle">HTTPS :8443</text>
+        <text x="505" y="145" fill="#60a5fa" font-size="10" text-anchor="middle">JWT Bearer token</text>
+
+        <!-- Сервер → MySQL -->
+        <path class="arrow-data" d="M 960 200 L 1000 200" marker-end="url(#arrow-data)" fill="none" stroke="#10b981" stroke-width="2"/>
+        <path class="arrow-data" d="M 960 370 L 1000 200" marker-end="url(#arrow-data)" fill="none" stroke="#10b981" stroke-width="2"/>
+        <!-- Сервер → SmartShell -->
+        <path class="arrow-data" d="M 960 280 L 1000 315" marker-end="url(#arrow-data)" fill="none" stroke="#10b981" stroke-width="2"/>
+        <text x="985" y="250" fill="#10b981" font-size="10">pymysql</text>
+        <text x="985" y="310" fill="#10b981" font-size="10">httpx</text>
+
+        <!-- Легенда стрелок -->
+        <rect x="680" y="540" width="600" height="340" rx="12" fill="#0a0e1a" stroke="#1f2937" stroke-width="1"/>
+        <text x="700" y="570" fill="#e4e7eb" font-size="14" font-weight="bold">🎯 Последовательность авторизации:</text>
+        <text x="700" y="595" fill="#9ca3af" font-size="12">1. MainWindow → HandoverDialog(client)</text>
+        <text x="700" y="615" fill="#9ca3af" font-size="12">2. HandoverDialog → LoginWidget × 2 (giver, receiver)</text>
+        <text x="700" y="635" fill="#9ca3af" font-size="12">3. LoginWidget._do_search() → ApiClient.search_employees()</text>
+        <text x="700" y="655" fill="#9ca3af" font-size="12">4. ApiClient → POST /api/employees/search (VPS)</text>
+        <text x="700" y="675" fill="#9ca3af" font-size="12">5. VPS → MySQL (SELECT faname) → ответ клиенту</text>
+        <text x="700" y="695" fill="#9ca3af" font-size="12">6. Пользователь выбирает ФИО, вводит пароль</text>
+        <text x="700" y="715" fill="#9ca3af" font-size="12">7. ApiClient.login(giver, password, point) → POST /api/auth/login</text>
+        <text x="700" y="735" fill="#9ca3af" font-size="12">8. VPS: verify_employee() → create_jwt_token() → JWT клиенту</text>
+        <text x="700" y="755" fill="#9ca3af" font-size="12">9. Клиент сохраняет JWT в current_session</text>
+        <text x="700" y="775" fill="#9ca3af" font-size="12">10. Все дальнейшие запросы идут с заголовком Authorization: Bearer</text>
+
+        <text x="700" y="810" fill="#fbbf24" font-size="12" font-weight="bold">🔒 Мастер-кредами SmartShell живут ТОЛЬКО на VPS</text>
+        <text x="700" y="830" fill="#fbbf24" font-size="12" font-weight="bold">📦 JWT токен живёт 12 часов</text>
+        <text x="700" y="850" fill="#fbbf24" font-size="12" font-weight="bold">⚡ SmartShell token кешируется 1 час</text>
+      </svg>
+    </div>
+
+    <!-- ============ IDEF0 ============ -->
+    <div class="panel" id="idef0">
+      <h2>📐 Функциональная модель IDEF0</h2>
+
+      <h3>Контекстная диаграмма (A-0)</h3>
+      <svg viewBox="0 0 1200 500" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arr-i" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b5563"/>
+          </marker>
+          <marker id="arr-in" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/>
+          </marker>
+          <marker id="arr-out" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/>
+          </marker>
+          <marker id="arr-ctrl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444"/>
+          </marker>
+          <marker id="arr-mech" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b5cf6"/>
+          </marker>
+        </defs>
+
+        <!-- Центральный блок A0 -->
+        <rect x="450" y="200" width="300" height="100" class="idef0-box" stroke-width="3"/>
+        <text x="600" y="240" text-anchor="middle" class="idef0-text" font-weight="bold" font-size="16">УПРАВЛЕНИЕ</text>
+        <text x="600" y="260" text-anchor="middle" class="idef0-text" font-weight="bold" font-size="16">ПЕРЕСМЕНКОЙ</text>
+        <text x="600" y="280" text-anchor="middle" class="idef0-text" font-size="13">(A0)</text>
+
+        <!-- ВХОДЫ (слева) -->
+        <rect x="40" y="150" width="200" height="40" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="140" y="175" text-anchor="middle" fill="#10b981" font-size="13">Список товаров</text>
+        <path d="M 240 170 L 450 240" class="idef0-flow flow-input" marker-end="url(#arr-in)"/>
+
+        <rect x="40" y="210" width="200" height="40" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="140" y="235" text-anchor="middle" fill="#10b981" font-size="13">Учётные остатки</text>
+        <path d="M 240 230 L 450 250" class="idef0-flow flow-input" marker-end="url(#arr-in)"/>
+
+        <rect x="40" y="270" width="200" height="40" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="140" y="295" text-anchor="middle" fill="#10b981" font-size="13">Фактические значения</text>
+        <path d="M 240 290 L 450 260" class="idef0-flow flow-input" marker-end="url(#arr-in)"/>
+
+        <rect x="40" y="330" width="200" height="40" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="140" y="355" text-anchor="middle" fill="#10b981" font-size="13">Данные сотрудников</text>
+        <path d="M 240 350 L 450 270" class="idef0-flow flow-input" marker-end="url(#arr-in)"/>
+
+        <!-- ВЫХОДЫ (справа) -->
+        <rect x="960" y="150" width="200" height="40" fill="#3d2e0a" stroke="#f59e0b" stroke-width="2"/>
+        <text x="1060" y="175" text-anchor="middle" fill="#f59e0b" font-size="13">PDF-отчёт смены</text>
+        <path d="M 750 240 L 960 170" class="idef0-flow flow-output" marker-end="url(#arr-out)"/>
+
+        <rect x="960" y="210" width="200" height="40" fill="#3d2e0a" stroke="#f59e0b" stroke-width="2"/>
+        <text x="1060" y="235" text-anchor="middle" fill="#f59e0b" font-size="13">Обновления SmartShell</text>
+        <path d="M 750 250 L 960 230" class="idef0-flow flow-output" marker-end="url(#arr-out)"/>
+
+        <rect x="960" y="270" width="200" height="40" fill="#3d2e0a" stroke="#f59e0b" stroke-width="2"/>
+        <text x="1060" y="295" text-anchor="middle" fill="#f59e0b" font-size="13">Записи audit_log</text>
+        <path d="M 750 260 L 960 290" class="idef0-flow flow-output" marker-end="url(#arr-out)"/>
+
+        <rect x="960" y="330" width="200" height="40" fill="#3d2e0a" stroke="#f59e0b" stroke-width="2"/>
+        <text x="1060" y="355" text-anchor="middle" fill="#f59e0b" font-size="13">Итоги пересменки</text>
+        <path d="M 750 270 L 960 350" class="idef0-flow flow-output" marker-end="url(#arr-out)"/>
+
+        <!-- УПРАВЛЕНИЕ (сверху) -->
+        <rect x="450" y="30" width="140" height="40" fill="#3d0a0a" stroke="#ef4444" stroke-width="2"/>
+        <text x="520" y="55" text-anchor="middle" fill="#ef4444" font-size="13">Whitelist причин</text>
+        <path d="M 520 70 L 520 200" class="idef0-flow flow-control" marker-end="url(#arr-ctrl)"/>
+
+        <rect x="610" y="30" width="140" height="40" fill="#3d0a0a" stroke="#ef4444" stroke-width="2"/>
+        <text x="680" y="55" text-anchor="middle" fill="#ef4444" font-size="13">Правила JWT</text>
+        <path d="M 680 70 L 680 200" class="idef0-flow flow-control" marker-end="url(#arr-ctrl)"/>
+
+        <rect x="450" y="90" width="300" height="35" fill="#3d0a0a" stroke="#ef4444" stroke-width="2"/>
+        <text x="600" y="112" text-anchor="middle" fill="#ef4444" font-size="13">Политика безопасности · UFW · Fail2ban</text>
+        <path d="M 600 125 L 600 200" class="idef0-flow flow-control" marker-end="url(#arr-ctrl)"/>
+
+        <!-- МЕХАНИЗМЫ (снизу) -->
+        <rect x="370" y="430" width="130" height="40" fill="#2d1a4d" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="435" y="455" text-anchor="middle" fill="#8b5cf6" font-size="13">Админ (ПК)</text>
+        <path d="M 435 430 L 485 300" class="idef0-flow flow-mechanism" marker-end="url(#arr-mech)"/>
+
+        <rect x="520" y="430" width="160" height="40" fill="#2d1a4d" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="600" y="455" text-anchor="middle" fill="#8b5cf6" font-size="13">VPS (FastAPI)</text>
+        <path d="M 600 430 L 600 300" class="idef0-flow flow-mechanism" marker-end="url(#arr-mech)"/>
+
+        <rect x="700" y="430" width="130" height="40" fill="#2d1a4d" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="765" y="455" text-anchor="middle" fill="#8b5cf6" font-size="13">SmartShell API</text>
+        <path d="M 765 430 L 715 300" class="idef0-flow flow-mechanism" marker-end="url(#arr-mech)"/>
+
+        <!-- Легенда -->
+        <rect x="20" y="410" width="320" height="80" fill="#0a0e1a" stroke="#1f2937" stroke-width="1"/>
+        <text x="35" y="430" fill="#e4e7eb" font-size="12" font-weight="bold">Условные обозначения IDEF0:</text>
+        <line x1="35" y1="445" x2="70" y2="445" stroke="#10b981" stroke-width="2" marker-end="url(#arr-in)"/>
+        <text x="80" y="450" fill="#10b981" font-size="11">Вход (Input)</text>
+        <line x1="35" y1="465" x2="70" y2="465" stroke="#f59e0b" stroke-width="2" marker-end="url(#arr-out)"/>
+        <text x="80" y="470" fill="#f59e0b" font-size="11">Выход (Output)</text>
+        <line x1="180" y1="445" x2="215" y2="445" stroke="#ef4444" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr-ctrl)"/>
+        <text x="225" y="450" fill="#ef4444" font-size="11">Управление (Control)</text>
+        <line x1="180" y1="465" x2="215" y2="465" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="3,2" marker-end="url(#arr-mech)"/>
+        <text x="225" y="470" fill="#8b5cf6" font-size="11">Механизм (Mechanism)</text>
+      </svg>
+
+      <h3>Декомпозиция A0 — детализация</h3>
+      <svg viewBox="0 0 1300 600" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b5563"/>
+          </marker>
+        </defs>
+
+        <!-- A1 Авторизация -->
+        <rect x="40" y="80" width="220" height="90" fill="#1a2133" stroke="#2C87FD" stroke-width="2"/>
+        <text x="150" y="110" text-anchor="middle" fill="#2C87FD" font-size="14" font-weight="bold">A1</text>
+        <text x="150" y="130" text-anchor="middle" fill="#e4e7eb" font-size="13">Авторизация</text>
+        <text x="150" y="148" text-anchor="middle" fill="#e4e7eb" font-size="13">сотрудника</text>
+        <text x="150" y="165" text-anchor="middle" fill="#9ca3af" font-size="10">LoginRequest → JWT</text>
+
+        <!-- A2 Загрузка товаров -->
+        <rect x="290" y="80" width="220" height="90" fill="#1a2133" stroke="#10b981" stroke-width="2"/>
+        <text x="400" y="110" text-anchor="middle" fill="#10b981" font-size="14" font-weight="bold">A2</text>
+        <text x="400" y="130" text-anchor="middle" fill="#e4e7eb" font-size="13">Загрузка и кеширование</text>
+        <text x="400" y="148" text-anchor="middle" fill="#e4e7eb" font-size="13">товаров</text>
+        <text x="400" y="165" text-anchor="middle" fill="#9ca3af" font-size="10">SmartShell → goods_cache</text>
+
+        <!-- A3 Инвентаризация -->
+        <rect x="540" y="80" width="220" height="90" fill="#1a2133" stroke="#f59e0b" stroke-width="2"/>
+        <text x="650" y="110" text-anchor="middle" fill="#f59e0b" font-size="14" font-weight="bold">A3</text>
+        <text x="650" y="130" text-anchor="middle" fill="#e4e7eb" font-size="13">Ввод фактических</text>
+        <text x="650" y="148" text-anchor="middle" fill="#e4e7eb" font-size="13">значений</text>
+        <text x="650" y="165" text-anchor="middle" fill="#9ca3af" font-size="10">Локально в памяти</text>
+
+        <!-- A4 Нормализация -->
+        <rect x="790" y="80" width="220" height="90" fill="#1a2133" stroke="#ef4444" stroke-width="2"/>
+        <text x="900" y="110" text-anchor="middle" fill="#ef4444" font-size="14" font-weight="bold">A4</text>
+        <text x="900" y="130" text-anchor="middle" fill="#e4e7eb" font-size="13">Нормализация</text>
+        <text x="900" y="148" text-anchor="middle" fill="#e4e7eb" font-size="13">расхождений</text>
+        <text x="900" y="165" text-anchor="middle" fill="#9ca3af" font-size="10">DISPOSAL / ADD</text>
+
+        <!-- A5 Отчётность -->
+        <rect x="1040" y="80" width="220" height="90" fill="#1a2133" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="1150" y="110" text-anchor="middle" fill="#8b5cf6" font-size="14" font-weight="bold">A5</text>
+        <text x="1150" y="130" text-anchor="middle" fill="#e4e7eb" font-size="13">Формирование</text>
+        <text x="1150" y="148" text-anchor="middle" fill="#e4e7eb" font-size="13">отчёта</text>
+        <text x="1150" y="165" text-anchor="middle" fill="#9ca3af" font-size="10">PDF + audit_log</text>
+
+        <!-- Связи между блоками -->
+        <path d="M 260 125 L 290 125" stroke="#4b5563" stroke-width="2" marker-end="url(#a2)"/>
+        <path d="M 510 125 L 540 125" stroke="#4b5563" stroke-width="2" marker-end="url(#a2)"/>
+        <path d="M 760 125 L 790 125" stroke="#4b5563" stroke-width="2" marker-end="url(#a2)"/>
+        <path d="M 1010 125 L 1040 125" stroke="#4b5563" stroke-width="2" marker-end="url(#a2)"/>
+
+        <!-- Детали каждого блока -->
+        <!-- A1 детали -->
+        <rect x="40" y="200" width="220" height="150" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="55" y="220" fill="#2C87FD" font-size="11" font-weight="bold">Входы:</text>
+        <text x="55" y="238" fill="#9ca3af" font-size="10">• faname, password, point</text>
+        <text x="55" y="258" fill="#2C87FD" font-size="11" font-weight="bold">Механизмы:</text>
+        <text x="55" y="276" fill="#9ca3af" font-size="10">• verify_employee()</text>
+        <text x="55" y="292" fill="#9ca3af" font-size="10">• create_jwt_token()</text>
+        <text x="55" y="312" fill="#2C87FD" font-size="11" font-weight="bold">Выходы:</text>
+        <text x="55" y="330" fill="#9ca3af" font-size="10">• JWT-токен (12ч)</text>
+        <text x="55" y="346" fill="#9ca3af" font-size="10">• warehouse_id</text>
+
+        <!-- A2 детали -->
+        <rect x="290" y="200" width="220" height="150" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="305" y="220" fill="#10b981" font-size="11" font-weight="bold">Входы:</text>
+        <text x="305" y="238" fill="#9ca3af" font-size="10">• JWT-токен</text>
+        <text x="305" y="258" fill="#10b981" font-size="11" font-weight="bold">Механизмы:</text>
+        <text x="305" y="276" fill="#9ca3af" font-size="10">• fetch_goods_from_ss()</text>
+        <text x="305" y="292" fill="#9ca3af" font-size="10">• goods_cache.load()</text>
+        <text x="305" y="312" fill="#10b981" font-size="11" font-weight="bold">Выходы:</text>
+        <text x="305" y="330" fill="#9ca3af" font-size="10">• ~387 товаров в кеше</text>
+        <text x="305" y="346" fill="#9ca3af" font-size="10">• локальный поиск</text>
+
+        <!-- A3 детали -->
+        <rect x="540" y="200" width="220" height="150" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="555" y="220" fill="#f59e0b" font-size="11" font-weight="bold">Входы:</text>
+        <text x="555" y="238" fill="#9ca3af" font-size="10">• Товары из кеша</text>
+        <text x="555" y="258" fill="#f59e0b" font-size="11" font-weight="bold">Механизмы:</text>
+        <text x="555" y="276" fill="#9ca3af" font-size="10">• QTableWidget</text>
+        <text x="555" y="292" fill="#9ca3af" font-size="10">• IntDelegate</text>
+        <text x="555" y="312" fill="#f59e0b" font-size="11" font-weight="bold">Выходы:</text>
+        <text x="555" y="330" fill="#9ca3af" font-size="10">• actuals_cache</text>
+        <text x="555" y="346" fill="#9ca3af" font-size="10">• DiscrepancyItem[]</text>
+
+        <!-- A4 детали -->
+        <rect x="790" y="200" width="220" height="150" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="805" y="220" fill="#ef4444" font-size="11" font-weight="bold">Входы:</text>
+        <text x="805" y="238" fill="#9ca3af" font-size="10">• DiscrepancyItem[]</text>
+        <text x="805" y="254" fill="#9ca3af" font-size="10">• Причины (выбор)</text>
+        <text x="805" y="274" fill="#ef4444" font-size="11" font-weight="bold">Механизмы:</text>
+        <text x="805" y="292" fill="#9ca3af" font-size="10">• validate_reason()</text>
+        <text x="805" y="308" fill="#9ca3af" font-size="10">• change_quantity_ss()</text>
+        <text x="805" y="328" fill="#ef4444" font-size="11" font-weight="bold">Выходы:</text>
+        <text x="805" y="346" fill="#9ca3af" font-size="10">• SmartShell обновлён</text>
+
+        <!-- A5 детали -->
+        <rect x="1040" y="200" width="220" height="150" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="1055" y="220" fill="#8b5cf6" font-size="11" font-weight="bold">Входы:</text>
+        <text x="1055" y="238" fill="#9ca3af" font-size="10">• Результаты нормализ.</text>
+        <text x="1055" y="254" fill="#9ca3af" font-size="10">• current_session</text>
+        <text x="1055" y="274" fill="#8b5cf6" font-size="11" font-weight="bold">Механизмы:</text>
+        <text x="1055" y="292" fill="#9ca3af" font-size="10">• log_audit() (JSON)</text>
+        <text x="1055" y="308" fill="#9ca3af" font-size="10">• generate_report()</text>
+        <text x="1055" y="328" fill="#8b5cf6" font-size="11" font-weight="bold">Выходы:</text>
+        <text x="1055" y="346" fill="#9ca3af" font-size="10">• PDF-файл отчёта</text>
+
+        <!-- Общая таблица -->
+        <rect x="40" y="380" width="1220" height="210" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="60" y="405" fill="#fbbf24" font-size="13" font-weight="bold">📋 Матрица потоков данных (ICOM):</text>
+
+        <text x="60" y="430" fill="#10b981" font-size="12" font-weight="bold">I (Inputs):</text>
+        <text x="70" y="450" fill="#9ca3af" font-size="11">I1: Список товаров SmartShell · I2: Данные сотрудников MySQL · I3: Фактические значения</text>
+        <text x="70" y="468" fill="#9ca3af" font-size="11">I4: JWT-токен · I5: Выбранные причины расхождений</text>
+
+        <text x="60" y="490" fill="#ef4444" font-size="12" font-weight="bold">C (Controls):</text>
+        <text x="70" y="510" fill="#9ca3af" font-size="11">C1: Whitelist разрешённых причин · C2: JWT_SECRET + TTL · C3: Политика UFW/Fail2ban</text>
+        <text x="70" y="528" fill="#9ca3af" font-size="11">C4: SSL-сертификат · C5: Rate-limits SmartShell</text>
+
+        <text x="60" y="550" fill="#f59e0b" font-size="12" font-weight="bold">O (Outputs):</text>
+        <text x="70" y="570" fill="#9ca3af" font-size="11">O1: JWT-токен · O2: Обновлённые остатки SmartShell · O3: audit_log с details JSON</text>
+        <text x="70" y="588" fill="#9ca3af" font-size="11">O4: PDF-отчёт смены · O5: Итоги в консоли (emoji настроения)</text>
+      </svg>
+    </div>
+
+    <!-- ============ ПОТОК ДАННЫХ ============ -->
+    <div class="panel" id="flow">
+      <h2>⚡ Поток данных: полный цикл пересменки</h2>
+
+      <svg viewBox="0 0 1300 1100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#2C87FD"/>
+          </marker>
+          <marker id="fa2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/>
+          </marker>
+          <marker id="fa3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/>
+          </marker>
+        </defs>
+
+        <!-- Временная шкала -->
+        <line x1="150" y1="80" x2="150" y2="1050" stroke="#1f2937" stroke-width="2" stroke-dasharray="5,5"/>
+
+        <!-- Этапы -->
+        <g>
+          <circle cx="150" cy="100" r="8" fill="#2C87FD"/>
+          <text x="170" y="105" fill="#2C87FD" font-size="14" font-weight="bold">1. Запуск приложения</text>
+          <text x="170" y="125" fill="#9ca3af" font-size="11">main.py → QApplication → MainWindow (client = ApiClient)</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="160" r="8" fill="#2C87FD"/>
+          <text x="170" y="165" fill="#2C87FD" font-size="14" font-weight="bold">2. Нажатие "Начать пересменку"</text>
+          <text x="170" y="185" fill="#9ca3af" font-size="11">MainWindow._start_handover() → HandoverDialog(client)</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="220" r="8" fill="#10b981"/>
+          <text x="170" y="225" fill="#10b981" font-size="14" font-weight="bold">3. Поиск сотрудников (автодополнение)</text>
+          <text x="170" y="245" fill="#9ca3af" font-size="11">LoginWidget._do_search() → ApiClient.search_employees(query)</text>
+        </g>
+
+        <!-- Блок запроса -->
+        <rect x="400" y="240" width="500" height="60" rx="6" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="415" y="262" fill="#10b981" font-size="12" font-weight="bold" font-family="monospace">POST https://78.17.47.74:8443/api/employees/search</text>
+        <text x="415" y="282" fill="#d1fae5" font-size="11" font-family="monospace">Body: {"query": "Ив"} → Response: {"employees": ["Иванов Иван", ...]}</text>
+        <text x="415" y="297" fill="#6ee7b7" font-size="10">📌 Публичный endpoint, без JWT (только ФИО, не пароли)</text>
+        <path d="M 300 245 L 400 270" stroke="#10b981" stroke-width="2" marker-end="url(#fa2)"/>
+
+        <g>
+          <circle cx="150" cy="325" r="8" fill="#2C87FD"/>
+          <text x="170" y="330" fill="#2C87FD" font-size="14" font-weight="bold">4. Выбор ФИО + ввод пароля</text>
+          <text x="170" y="350" fill="#9ca3af" font-size="11">LoginWidget._on_confirm() → giver_password сохраняется в памяти</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="385" r="8" fill="#10b981"/>
+          <text x="170" y="390" fill="#10b981" font-size="14" font-weight="bold">5. Авторизация на сервере</text>
+          <text x="170" y="410" fill="#9ca3af" font-size="11">ApiClient.login(giver, password, point_name)</text>
+        </g>
+
+        <rect x="400" y="405" width="500" height="60" rx="6" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="415" y="427" fill="#10b981" font-size="12" font-weight="bold" font-family="monospace">POST /api/auth/login</text>
+        <text x="415" y="447" fill="#d1fae5" font-size="11" font-family="monospace">Body: {"faname", "password", "point_name"}</text>
+        <text x="415" y="462" fill="#6ee7b7" font-size="10">🔐 VPS: verify_employee() + create_jwt_token() → JWT на 12 часов</text>
+        <path d="M 300 410 L 400 435" stroke="#10b981" stroke-width="2" marker-end="url(#fa2)"/>
+
+        <g>
+          <circle cx="150" cy="490" r="8" fill="#2C87FD"/>
+          <text x="170" y="495" fill="#2C87FD" font-size="14" font-weight="bold">6. Открытие окна инвентаризации</text>
+          <text x="170" y="515" fill="#9ca3af" font-size="11">InventoryWindow → goods_cache.load() (один запрос к SmartShell)</text>
+        </g>
+
+        <rect x="400" y="510" width="500" height="45" rx="6" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="415" y="532" fill="#10b981" font-size="12" font-weight="bold" font-family="monospace">GET /api/goods/list (JWT: Bearer ...)</text>
+        <text x="415" y="550" fill="#6ee7b7" font-size="10">📦 VPS → SmartShell GraphQL → 387 товаров → goods_cache (клиент)</text>
+        <path d="M 300 515 L 400 532" stroke="#10b981" stroke-width="2" marker-end="url(#fa2)"/>
+
+        <g>
+          <circle cx="150" cy="580" r="8" fill="#f59e0b"/>
+          <text x="170" y="585" fill="#f59e0b" font-size="14" font-weight="bold">7. Поиск товара (мгновенно!)</text>
+          <text x="170" y="605" fill="#9ca3af" font-size="11">goods_cache.filter_local("Baby") → &lt;1 мс, без сети</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="640" r="8" fill="#f59e0b"/>
+          <text x="170" y="645" fill="#f59e0b" font-size="14" font-weight="bold">8. Ввод фактических значений</text>
+          <text x="170" y="665" fill="#9ca3af" font-size="11">QTableWidget → Product.actual → actuals_cache</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="700" r="8" fill="#ef4444"/>
+          <text x="170" y="705" fill="#ef4444" font-size="14" font-weight="bold">9. Закрытие смены → нормализация</text>
+          <text x="170" y="725" fill="#9ca3af" font-size="11">NormalizationService.get_discrepancies() → NormalizationDialog</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="760" r="8" fill="#ef4444"/>
+          <text x="170" y="765" fill="#ef4444" font-size="14" font-weight="bold">10. Выбор причин расхождений</text>
+          <text x="170" y="785" fill="#9ca3af" font-size="11">ComboBox → REASONS_LESS / REASONS_MORE (whitelist)</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="820" r="8" fill="#10b981"/>
+          <text x="170" y="825" fill="#10b981" font-size="14" font-weight="bold">11. Для каждого расхождения — запрос к серверу</text>
+          <text x="170" y="845" fill="#9ca3af" font-size="11">NormalizationWorker → ApiClient.normalize_single() (N запросов)</text>
+        </g>
+
+        <rect x="400" y="840" width="500" height="75" rx="6" fill="#0a3d2e" stroke="#10b981" stroke-width="2"/>
+        <text x="415" y="862" fill="#10b981" font-size="12" font-weight="bold" font-family="monospace">POST /api/normalize/single</text>
+        <text x="415" y="882" fill="#d1fae5" font-size="11" font-family="monospace">Body: {product_id, product_title, delta, reason, type, ...}</text>
+        <text x="415" y="897" fill="#6ee7b7" font-size="10">🔒 VPS: валидация → log_audit(details JSON) → change_quantity_ss()</text>
+        <text x="415" y="912" fill="#6ee7b7" font-size="10">📝 SmartShell логирует каждую операцию отдельно (DISPOSAL/ADD)</text>
+        <path d="M 300 845 L 400 875" stroke="#10b981" stroke-width="2" marker-end="url(#fa2)"/>
+
+        <g>
+          <circle cx="150" cy="945" r="8" fill="#8b5cf6"/>
+          <text x="170" y="950" fill="#8b5cf6" font-size="14" font-weight="bold">12. Генерация PDF-отчёта</text>
+          <text x="170" y="970" fill="#9ca3af" font-size="11">report_generator.generate_normalization_report() → PDF файл</text>
+        </g>
+
+        <g>
+          <circle cx="150" cy="1005" r="8" fill="#8b5cf6"/>
+          <text x="170" y="1010" fill="#8b5cf6" font-size="14" font-weight="bold">13. Закрытие сессии</text>
+          <text x="170" y="1030" fill="#9ca3af" font-size="11">current_session.is_open = False · goods_cache.unsubscribe() · close()</text>
+        </g>
+
+        <!-- Легенда цветов -->
+        <rect x="950" y="80" width="300" height="180" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="965" y="105" fill="#fbbf24" font-size="13" font-weight="bold">Легенда этапов:</text>
+        <circle cx="975" cy="125" r="6" fill="#2C87FD"/>
+        <text x="990" y="130" fill="#9ca3af" font-size="11">Клиентская логика (GUI)</text>
+        <circle cx="975" cy="150" r="6" fill="#10b981"/>
+        <text x="990" y="155" fill="#9ca3af" font-size="11">Сетевое взаимодействие</text>
+        <circle cx="975" cy="175" r="6" fill="#f59e0b"/>
+        <text x="990" y="180" fill="#9ca3af" font-size="11">Локальные операции (кеш)</text>
+        <circle cx="975" cy="200" r="6" fill="#ef4444"/>
+        <text x="990" y="205" fill="#9ca3af" font-size="11">Критические (нормализация)</text>
+        <circle cx="975" cy="225" r="6" fill="#8b5cf6"/>
+        <text x="990" y="230" fill="#9ca3af" font-size="11">Финализация (PDF, выход)</text>
+        <text x="965" y="250" fill="#6ee7b7" font-size="10">Всего сетевых запросов: ~3 + N</text>
+
+        <!-- Итоговая статистика -->
+        <rect x="950" y="280" width="300" height="200" fill="#0a0e1a" stroke="#1f2937"/>
+        <text x="965" y="305" fill="#fbbf24" font-size="13" font-weight="bold">📊 Статистика цикла:</text>
+        <text x="965" y="330" fill="#9ca3af" font-size="11">• search_employees: ~5-10 запросов</text>
+        <text x="965" y="350" fill="#9ca3af" font-size="11">• login: 1 запрос</text>
+        <text x="965" y="370" fill="#9ca3af" font-size="11">• goods/list: 1 запрос (кешируется)</text>
+        <text x="965" y="390" fill="#9ca3af" font-size="11">• Локальный поиск: 0 запросов</text>
+        <text x="965" y="410" fill="#9ca3af" font-size="11">• normalize_single: N запросов</text>
+        <text x="965" y="430" fill="#10b981" font-size="11" font-weight="bold">Экономия: ~95% трафика</text>
+        <text x="965" y="450" fill="#9ca3af" font-size="11" font-weight="bold">(vs. без кеша)</text>
+        <text x="965" y="470" fill="#fbbf24" font-size="11">Средняя смена: 3-5 мин</text>
+      </svg>
+
+      <h3>🎯 Ключевые принципы архитектуры</h3>
+      <table>
+        <tr><th>Принцип</th><th>Реализация</th><th>Результат</th></tr>
+        <tr><td>🔐 Мастер-кредали изолированы</td><td>SS_LOGIN/SS_PASSWORD только на VPS</td><td>Клиент не может списать товар напрямую</td></tr>
+        <tr><td>⚡ Кеш товаров на клиенте</td><td>goods_cache (Singleton, TTL 10 мин)</td><td>Поиск мгновенный, -95% запросов</td></tr>
+        <tr><td>📝 Детальный аудит</td><td>audit_log.details (JSON)</td><td>Каждое списание — с товаром, причиной, IP</td></tr>
+        <tr><td>🎨 Темы переносимы</td><td>user_themes/ рядом с exe + относительные пути</td><td>Темы не теряются при обновлениях</td></tr>
+        <tr><td>🔌 Обратная совместимость</td><td>Legacy smartshell_client.py оставлен</td><td>Можно переключиться на прямой режим для отладки</td></tr>
+        <tr><td>🛡️ Whitelist причин</td><td>ALLOWED_REASONS_LESS/MORE на VPS</td><td>Админ не может списать с произвольной причиной</td></tr>
+      </table>
+    </div>
+
+  </div>
+
+  <p class="subtitle" style="margin-top: 32px;">Сгенерировано для проекта CyberMG · Июль 2026</p>
+</div>
+
+<script>
+  function showPanel(id) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+    event.target.classList.add('active');
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,75 @@
+┌─────────────────────────────────────────────────────────────┐
+│  КЛИЕНТ (inventory_window.py → normalization.py)            │
+├─────────────────────────────────────────────────────────────┤
+│  get_discrepancies() находит 4 товара:                      │
+│    • HQD Cherry: +1 (ADD)                                   │
+│    • HQD Mango:  +1 (ADD)                                   │
+│    • HQD Classic: -1 (DISPOSAL)                             │
+│    • HQD Berry:  -1 (DISPOSAL)                              │
+│                                                             │
+│  execute_normalization() формирует пакет:                   │
+│    operations = [                                           │
+│      {product_id: 1, type: "ADD", delta: 1, ...},           │
+│      {product_id: 2, type: "ADD", delta: 1, ...},           │
+│      {product_id: 3, type: "DISPOSAL", delta: -1, ...},     │
+│      {product_id: 4, type: "DISPOSAL", delta: -1, ...},     │
+│    ]                                                        │
+│                                                             │
+│  🚀 ОДИН HTTP POST /api/normalize (все 4 товара)            │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  VPS (main.py → /api/normalize)                             │
+├─────────────────────────────────────────────────────────────┤
+│  Получил пакет из 4 операций                                │
+│                                                             │
+│  Разделяет по типу:                                         │
+│    DISPOSAL: 2 товара (id=3, id=4)                          │
+│    ADD:      2 товара (id=1, id=2)                          │
+│                                                             │
+│  Логирует в audit_log: ОДНА запись                          │
+│    "NORMALIZE_BATCH (2D/2A)"                                │
+│                                                             │
+│  🚀 1-й HTTP POST к SmartShell (DISPOSAL):                  │
+│    mutation ($input1: ChangeGoodsQuantityInput!) {          │
+│      batch1: changeGoodsQuantity(input: $input1)            │
+│    }                                                        │
+│    variables: {input1: {items: [id3, id4], operation: "D"}} │
+│                                                             │
+│  🚀 2-й HTTP POST к SmartShell (ADD):                       │
+│    mutation ($input1: ChangeGoodsQuantityInput!) {          │
+│      batch1: changeGoodsQuantity(input: $input1)            │
+│    }                                                        │
+│    variables: {input1: {items: [id1, id2], operation: "A"}} │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  SMARTSHELL (GraphQL API)                                   │
+├─────────────────────────────────────────────────────────────┤
+│  Запрос 1: changeGoodsQuantity(DISPOSAL, 2 товара) → OK     │
+│  Запрос 2: changeGoodsQuantity(ADD, 2 товара) → OK          │
+│                                                             │
+│  Rate limit потрачено: 2 из 50 (4%) ✅                         │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│  КЛИЕНТ (получает ответ)                                    │
+├─────────────────────────────────────────────────────────────┤
+│  Response: {                                                │
+│    "success": 4,                                            │
+│    "failed": 0,                                             │
+│    "operations": [                                          │
+│      {product_id: 1, success: true},                        │
+│      {product_id: 2, success: true},                        │
+│      {product_id: 3, success: true},                        │
+│      {product_id: 4, success: true},                        │
+│    ],                                                       │
+│    "chunks_info": {                                         │
+│      "disposal": {total_items: 2, successful_items: 2},     │
+│      "add": {total_items: 2, successful_items: 2}           │
+│    }                                                        │
+│  }                                                          │
+│                                                             │
+│  normalization.py → возвращает result в inventory_window    │
+│  inventory_window → показывает успех пользователю           │
+└─────────────────────────────────────────────────────────────┘
