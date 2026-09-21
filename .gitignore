@@ -1,59 +1,49 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+# ============================================
+#  БОЛЬШИЕ ФАЙЛЫ (НЕ коммитим в Git)
+# ============================================
+# Анимации и медиа
+*.gif
+*.mp4
+*.mov
+*.avi
+*.webm
 
-# Виртуальное окружение
-venv/
-env/
-ENV/
-.venv/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Секреты (НИКОГДА не коммитить)
-.env
-config.local.py
-*.pem
-*.key
-certs/
-
-# Отчёты (слишком большие для GitHub)
+# Отчёты (генерируются локально)
 reports/
 *.pdf
+
+# Базы данных
+*.db
+*.sqlite
+*.sqlite3
+*.sql
 
 # Логи
 logs/
 *.log
+
+# Кеш и временные файлы
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+*.cache
+
+# Секреты
+.env
+.env.local
+config.local.py
+*.pem
+*.key
+certs/
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# БД
-*.db
-*.sqlite
-*.sqlite3
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
