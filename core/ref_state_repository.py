@@ -6,12 +6,12 @@ import httpx
 from datetime import datetime
 from config import PROXY_SERVER_URL, API_SECRET_KEY
 
+
 class RefStateRepository:
-    def __init__(self, client=None):
-        self.client = client
+    def __init__(self):
         self.base_url = f"{PROXY_SERVER_URL}/api/ref-state"
         self.headers = {
-            "X-API-Secret": API_SECRET_KEY,
+            "X-API-Key": API_SECRET_KEY,  # ✅ ИСПРАВЛЕНО: было X-API-Secret
             "Content-Type": "application/json",
         }
     
@@ -42,12 +42,35 @@ class RefStateRepository:
                     headers=self.headers,
                     json=data,
                 )
-                r.raise_for_status()
-                result = r.json()
-                print(f"[RefState] ✓ general сохранён (id={result.get('id')})")
-                return {"success": True, "id": result.get("id")}
+                
+                if r.status_code == 200:
+                    result = r.json()
+                    if result.get("success"):
+                        print(f"[RefState] ✓ general сохранён (id={result.get('id')})")
+                        return {"success": True, "id": result.get("id")}
+                    else:
+                        print(f"[RefState] ✗ Сервер вернул ошибку: {result}")
+                        return {"success": False, "error": str(result)}
+                
+                elif r.status_code == 401:
+                    print(f"[RefState] ✗ Ошибка авторизации: неверный API key")
+                    return {"success": False, "error": "unauthorized"}
+                
+                elif r.status_code == 422:
+                    print(f"[RefState] ✗ Ошибка валидации: {r.text[:200]}")
+                    return {"success": False, "error": f"validation: {r.text[:200]}"}
+                
+                else:
+                    print(f"[RefState] ✗ HTTP {r.status_code}: {r.text[:200]}")
+                    return {"success": False, "error": f"http_{r.status_code}"}
+        
+        except httpx.TimeoutException:
+            print(f"[RefState] ✗ Таймаут при сохранении general")
+            return {"success": False, "error": "timeout"}
         except Exception as e:
             print(f"[RefState] ✗ Ошибка сохранения general: {e}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
     
     def save_detailed(self, general_id: int, items: list) -> dict:
@@ -84,10 +107,33 @@ class RefStateRepository:
                     headers=self.headers,
                     json=payload,
                 )
-                r.raise_for_status()
-                result = r.json()
-                print(f"[RefState] ✓ detailed сохранён ({result.get('inserted', 0)} записей)")
-                return {"success": True, "inserted": result.get("inserted", 0)}
+                
+                if r.status_code == 200:
+                    result = r.json()
+                    if result.get("success"):
+                        print(f"[RefState] ✓ detailed сохранён ({result.get('inserted', 0)} записей)")
+                        return {"success": True, "inserted": result.get("inserted", 0)}
+                    else:
+                        print(f"[RefState] ✗ Сервер вернул ошибку: {result}")
+                        return {"success": False, "error": str(result)}
+                
+                elif r.status_code == 401:
+                    print(f"[RefState] ✗ Ошибка авторизации: неверный API key")
+                    return {"success": False, "error": "unauthorized"}
+                
+                elif r.status_code == 422:
+                    print(f"[RefState] ✗ Ошибка валидации: {r.text[:200]}")
+                    return {"success": False, "error": f"validation: {r.text[:200]}"}
+                
+                else:
+                    print(f"[RefState] ✗ HTTP {r.status_code}: {r.text[:200]}")
+                    return {"success": False, "error": f"http_{r.status_code}"}
+        
+        except httpx.TimeoutException:
+            print(f"[RefState] ✗ Таймаут при сохранении detailed")
+            return {"success": False, "error": "timeout"}
         except Exception as e:
             print(f"[RefState] ✗ Ошибка сохранения detailed: {e}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
