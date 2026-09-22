@@ -1628,9 +1628,8 @@ class TelegramRefStateRequest(BaseModel):
 async def save_ref_state_general(
     req: RefStateGeneralRequest,
     request: Request,
-    user: dict = Depends(get_current_user),
 ):
-    """Сохраняет общий отчёт в refStateGeneral."""
+    """Сохраняет общий отчёт в refStateGeneral (без JWT, только X-API-Key)."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1654,10 +1653,11 @@ async def save_ref_state_general(
             conn.commit()
             new_id = cur.lastrowid
         
+        # 🆕 Упрощённый аудит без user (т.к. нет JWT)
         log_audit({
-            "faname": user["faname"],
+            "faname": req.administrator,
             "point_name": req.point_name,
-            "warehouse_id": user["warehouse_id"],
+            "warehouse_id": 0,
             "operation_type": "REF_STATE_GENERAL_SAVE",
             "product_count": req.items_on_check,
             "ip": request.client.host,
@@ -1683,14 +1683,12 @@ async def save_ref_state_general(
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
 
-
 @app.post("/api/ref-state/detailed")
 async def save_ref_state_detailed(
     req: RefStateDetailedRequest,
     request: Request,
-    user: dict = Depends(get_current_user),
 ):
-    """Сохраняет детализацию (каждая ссылка по товару) в refStateDetailed."""
+    """Сохраняет детализацию (без JWT, только X-API-Key)."""
     if not req.items:
         return {"success": True, "inserted": 0, "message": "Нет записей"}
     
@@ -1718,10 +1716,13 @@ async def save_ref_state_detailed(
                 inserted += 1
             conn.commit()
         
+        # Администратора берём из первой записи
+        admin_name = req.items[0].administrator if req.items else "system"
+        
         log_audit({
-            "faname": user["faname"],
-            "point_name": user["point_name"],
-            "warehouse_id": user["warehouse_id"],
+            "faname": admin_name,
+            "point_name": "system",
+            "warehouse_id": 0,
             "operation_type": "REF_STATE_DETAILED_SAVE",
             "product_count": inserted,
             "ip": request.client.host,
@@ -1742,42 +1743,85 @@ async def save_ref_state_detailed(
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
 
-
 # ============================================================
 # 🆕 v1.5.0: Telegram — отправка refState-отчётов по топикам
 # ============================================================
-@app.post("/api/telegram/send-ref-state")
-async def send_ref_state_telegram(
-    req: TelegramRefStateRequest,
+@app.post("/api/telegram/send-ref-state-with-pdf")
+async def send_ref_state_with_pdf(
     request: Request,
-    user: dict = Depends(get_current_user),
+    point_name: str = Form(...),
+    message: str = Form(...),
+    parse_mode: str = Form("HTML"),
+    pdf_file: UploadFile = File(...),
 ):
     """
-    Отправляет refState-отчёт в Telegram топик конкретной точки.
-    Использует send_telegram_to_topic() для маршрутизации по филиалу.
+    Отправляет PDF-отчёт в Telegram топик (без JWT, только X-API-Key).
     """
-    result = await send_telegram_to_topic(
-        point_name=req.point_name,
-        message=req.message,
-        parse_mode=req.parse_mode,
-    )
+    topic_id = TELEGRAM_TOPIC_MAP.get(point_name)
+    if not topic_id or topic_id <= 0:
+        return {"success": False, "error": f"no valid topic_id for '{point_name}'"}
     
-    if result["success"]:
-        log_audit({
-            "faname": user["faname"],
-            "point_name": req.point_name,
-            "warehouse_id": user["warehouse_id"],
-            "operation_type": "TELEGRAM_REF_STATE_SEND",
-            "product_count": 0,
-            "ip": request.client.host,
-            "user_agent": request.headers.get("user-agent", ""),
-            "details": {
-                "message_id": result.get("message_id"),
-                "message_length": len(req.message),
-            },
-        })
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"success": False, "error": "bot/chat_id not configured"}
     
-    return result
+    content = await pdf_file.read()
+    file_size = len(content)
+    if file_size > 50 * 1024 * 1024:
+        return {"success": False, "error": "file too large (>50MB)"}
+    
+    caption = message
+    caption_truncated = False
+    if len(caption) > 1024:
+        caption = caption[:1020] + "..."
+        caption_truncated = True
+        logger.warning(f"[Telegram] ⚠ Caption обрезан с {len(message)} до 1024 символов")
+    
+    try:
+        import io
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        
+        files = {
+            "document": (
+                pdf_file.filename or "report.pdf",
+                io.BytesIO(content),
+                "application/pdf"
+            )
+        }
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_thread_id": topic_id,
+            "caption": caption,
+            "parse_mode": parse_mode,
+        }
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, data=data, files=files)
+            
+            if r.status_code == 200:
+                result_data = r.json()
+                message_id = result_data.get("result", {}).get("message_id")
+                logger.info(
+                    f"[Telegram] ✓ PDF отправлен в топик '{point_name}' "
+                    f"(topic_id={topic_id}, message_id={message_id}, size={file_size} bytes)"
+                )
+                return {
+                    "success": True,
+                    "message_id": message_id,
+                    "file_size": file_size,
+                    "caption_truncated": caption_truncated,
+                }
+            else:
+                logger.error(f"[Telegram] ✗ HTTP {r.status_code}: {r.text[:500]}")
+                return {"success": False, "error": f"HTTP {r.status_code}"}
+    
+    except httpx.TimeoutException:
+        logger.error(f"[Telegram] ✗ Timeout при отправке PDF в {point_name}")
+        return {"success": False, "error": "timeout"}
+    except Exception as e:
+        logger.error(f"[Telegram] ✗ Ошибка отправки PDF: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
 # ============================================================
 # 🆕 v1.5.0: Telegram — отправка PDF с caption (подписью)

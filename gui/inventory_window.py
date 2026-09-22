@@ -999,43 +999,38 @@ class InventoryWindow(QMainWindow):
         financial_summary: dict,
     ):
         """
-        Сохраняет refStateGeneral + refStateDetailed в БД
-        и отправляет отчёт с PDF в Telegram-топик филиала.
+        🆕 v1.5.1: Отправляет отчёт о смене в Telegram ВСЕГДА при закрытии,
+        независимо от наличия trouble-ссылок.
         
-        Срабатывает только если есть товары на ручной проверке (allRef).
-        Ошибки не критичные — закрытие смены продолжается даже при сбое Telegram.
+        - Telegram + PDF → всегда
+        - refStateGeneral → всегда (общий отчёт о смене)
+        - refStateDetailed → только если есть allRef (товары на проверке со ссылками)
         """
-        if not trouble_result:
-            print("[RefState] ⏭ Нет trouble_result — пропуск")
-            return
-        
-        all_ref = trouble_result.get("allRef", [])
-        if not all_ref:
-            print("[RefState] ⏭ Нет товаров на проверке (allRef пустой) — пропуск")
-            return
-        
-        # === Собираем данные для general ===
+        from core.ref_state_repository import RefStateRepository
+        from core.telegram_service import TelegramService
+        # === Базовые данные о смене (всегда доступны) ===
         point_name = current_session.point_name or "Неизвестная точка"
         administrator = current_session.giver or "Неизвестный"
         session_label = current_session.shift_label or ""
         date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         
-        # Уникальные виды товара (по title)
-        unique_titles = set(
-            r.get("product_title") or r.get("title") or "" 
-            for r in all_ref
-        )
-        unique_titles.discard("")
-        total_types = len(unique_titles)
+        # === Считаем общие итоги смены ===
+        total_products = len(all_products)
+        counted_products = sum(1 for p in all_products if p.actual is not None)
         
-        # Общее количество позиций
-        total_items = sum(r.get("quantity", 0) for r in all_ref)
+        # Расхождения
+        less_count = sum(1 for p in all_products if p.status == "less")
+        more_count = sum(1 for p in all_products if p.status == "more")
+        equal_count = sum(1 for p in all_products if p.status == "equal")
         
-        # Общая сумма
-        total_value = sum(r.get("value", 0) for r in all_ref)
+        # Финансовая ответственность
+        total_liability = financial_summary.get("total_liability_value", 0.0)
+        total_liability_items = financial_summary.get("total_liability_items", 0)
         
-        # Количество товаров на проверке
-        items_on_check = len(all_ref)
+        # === Собираем ссылки из trouble_result (если есть) ===
+        all_ref = []
+        if trouble_result:
+            all_ref = trouble_result.get("allRef", []) or []
         
         # Уникальные ссылки
         unique_refs = list(set(
@@ -1043,51 +1038,93 @@ class InventoryWindow(QMainWindow):
             if r.get("reference")
         ))
         links_count = len(unique_refs)
+        items_on_check = len(all_ref)
         
-        # === 1. Сохраняем refStateGeneral ===
-        repo = RefStateRepository()
-        general_data = {
-            "point_name": point_name,
-            "administrator": administrator,
-            "session_label": session_label,
-            "total_types": total_types,
-            "total_items": total_items,
-            "total_value": total_value,
-            "items_on_check": items_on_check,
-            "links_count": links_count,
-            "pdf_path": pdf_path,
-        }
-        general_result = repo.save_general(general_data)
+        # === 1. Сохраняем refStateGeneral (всегда) ===
+        try:
+            repo = RefStateRepository()
+            general_data = {
+                "point_name": point_name,
+                "administrator": administrator,
+                "session_label": session_label,
+                "total_types": len(set(p.title for p in all_products if p.actual is not None)),
+                "total_items": counted_products,
+                "total_value": total_liability,
+                "items_on_check": items_on_check,
+                "links_count": links_count,
+                "pdf_path": pdf_path,
+            }
+            general_result = repo.save_general(general_data)
+            
+            # === 2. Сохраняем refStateDetailed (только если есть ссылки) ===
+            if general_result.get("success") and all_ref:
+                general_id = general_result["id"]
+                detailed_items = []
+                for ref in all_ref:
+                    detailed_items.append({
+                        "administrator": administrator,
+                        "product_title": ref.get("product_title") or ref.get("title") or "—",
+                        "product_id": ref.get("product_id"),
+                        "reference": ref.get("reference") or "",
+                        "quantity": ref.get("quantity", 0),
+                        "value": ref.get("value", 0),
+                        "reason": ref.get("reason") or "",
+                    })
+                repo.save_detailed(general_id, detailed_items)
+        except Exception as e:
+            print(f"[RefState] ✗ Ошибка сохранения в БД: {e}")
+            import traceback; traceback.print_exc()
         
-        # === 2. Сохраняем refStateDetailed ===
-        if general_result.get("success"):
-            general_id = general_result["id"]
-            detailed_items = []
-            for ref in all_ref:
-                detailed_items.append({
-                    "administrator": administrator,
-                    "product_title": ref.get("product_title") or ref.get("title") or "—",
-                    "product_id": ref.get("product_id"),
-                    "reference": ref.get("reference") or "",
-                    "quantity": ref.get("quantity", 0),
-                    "value": ref.get("value", 0),
-                    "reason": ref.get("reason") or "",
-                })
-            repo.save_detailed(general_id, detailed_items)
+        # === 3. Формируем текст отчёта ===
+        mood_emoji, _ = self._get_mood_emoji(less_count)
         
-        # === 3. Отправляем в Telegram (с PDF) ===
-        telegram = TelegramService()
-        telegram.send_ref_state_report(
-            point_name=point_name,
-            administrator=administrator,
-            date_str=date_str,
-            total_types=total_types,
-            total_items=total_items,
-            total_value=total_value,
-            items_on_check=items_on_check,
-            references=unique_refs,
-            pdf_path=pdf_path,  # ← если PDF есть, отправится с caption
-        )
+        lines = [
+            f"<b>📋 Отчёт о смене</b>",
+            f"<b>{date_str}</b> • {administrator}",
+            f"📍 <b>{point_name}</b> ({session_label})",
+            "",
+            f"📊 <b>Итоги:</b>",
+            f"• Всего товаров: <b>{total_products}</b>",
+            f"• Посчитано: <b>{counted_products}</b>",
+            f"• Сходится: <b>{equal_count}</b>",
+            f"• Недостача: <b>{less_count}</b> {mood_emoji}",
+            f"• Избыток: <b>{more_count}</b>",
+        ]
+        
+        # Финансовая ответственность (только если есть)
+        if total_liability > 0:
+            lines.append("")
+            lines.append(f"💰 <b>К возмещению:</b> {total_liability:.2f}₽ ({total_liability_items} шт)")
+        
+        # Товары на проверке (только если есть ссылки)
+        if items_on_check > 0:
+            lines.append("")
+            lines.append(f"🔍 <b>Товары на проверке:</b> {items_on_check}")
+            lines.append(f"🔗 <b>Ссылок:</b> {links_count}")
+            lines.append("")
+            lines.append("<b>Ссылки:</b>")
+            for ref in sorted(unique_refs):
+                lines.append(f"• {ref}")
+        
+        message = "\n".join(lines)
+        
+        # === 4. Отправляем в Telegram (ВСЕГДА, даже без PDF) ===
+        try:
+            telegram = TelegramService()
+            telegram.send_ref_state_report(
+                point_name=point_name,
+                administrator=administrator,
+                date_str=date_str,
+                total_types=len(set(p.title for p in all_products if p.actual is not None)),
+                total_items=counted_products,
+                total_value=total_liability,
+                items_on_check=items_on_check,
+                references=unique_refs,
+                pdf_path=pdf_path,
+            )
+        except Exception as e:
+            print(f"[Telegram] ✗ Ошибка отправки: {e}")
+            import traceback; traceback.print_exc()
 
     # ============================================================
     #  🔒 БЕЗОПАСНОЕ ЗАКРЫТИЕ ПЕРЕСЧЁТА

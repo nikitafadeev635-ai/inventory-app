@@ -6,7 +6,6 @@ import httpx
 from datetime import datetime
 from config import PROXY_SERVER_URL, API_SECRET_KEY
 
-
 class RefStateRepository:
     def __init__(self, client=None):
         self.client = client
