@@ -987,9 +987,8 @@ class InventoryWindow(QMainWindow):
         self._apply_filters()
         self._status(f"📱 Применено: {applied_manual} точных + {applied_singles} одиночных + {applied_algo} групп (алгоритм)")
 
-
     # ============================================================
-    #  🆕 v1.5.0: СОХРАНЕНИЕ refState + ОТПРАВКА В TELEGRAM
+    #  🆕 v1.5.3: СОХРАНЕНИЕ refState + ОТПРАВКА В TELEGRAM
     # ============================================================
     def _save_ref_state_and_send_telegram(
         self,
@@ -997,135 +996,162 @@ class InventoryWindow(QMainWindow):
         all_products: list,
         pdf_path: str,
         financial_summary: dict,
+        plan,  # 🆕 ОБЯЗАТЕЛЬНО: план нормализации
     ):
         """
-        🆕 v1.5.1: Отправляет отчёт о смене в Telegram ВСЕГДА при закрытии,
-        независимо от наличия trouble-ссылок.
+        v1.5.3: Отправляет отчёт о смене СТРОГО ПО ШАБЛОНУ.
+        Данные берутся из ПЛАНА НОРМАЛИЗАЦИИ (DISPOSAL = реальные минусы).
         
-        - Telegram + PDF → всегда
-        - refStateGeneral → всегда (общий отчёт о смене)
-        - refStateDetailed → только если есть allRef (товары на проверке со ссылками)
+        Формат сообщения:
+            <Дата> <Отдающий смену>
+            <N видов>, <M позиций>, <сумма минусов>
+            Переданные товары на проверку: <K>
+            
+            Ссылки:
+            • <группа> (<кол-во> шт): <ссылка>
         """
         from core.ref_state_repository import RefStateRepository
         from core.telegram_service import TelegramService
-        # === Базовые данные о смене (всегда доступны) ===
+        
         point_name = current_session.point_name or "Неизвестная точка"
         administrator = current_session.giver or "Неизвестный"
         session_label = current_session.shift_label or ""
         date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         
-        # === Считаем общие итоги смены ===
-        total_products = len(all_products)
-        counted_products = sum(1 for p in all_products if p.actual is not None)
+        # === 1. Данные из ПЛАНА НОРМАЛИЗАЦИИ (только DISPOSAL = минусы) ===
+        disposal_operations = []
+        if plan and plan.get("operations"):
+            disposal_operations = [
+                op for op in plan["operations"] 
+                if op.get("type") == "DISPOSAL"
+            ]
         
-        # Расхождения
-        less_count = sum(1 for p in all_products if p.status == "less")
-        more_count = sum(1 for p in all_products if p.status == "more")
-        equal_count = sum(1 for p in all_products if p.status == "equal")
+        # Уникальные виды товаров в минусах (по названию)
+        unique_titles = set(op.get("product_title", "") for op in disposal_operations)
+        unique_titles.discard("")
+        total_types = len(unique_titles)
         
-        # Финансовая ответственность
-        total_liability = financial_summary.get("total_liability_value", 0.0)
-        total_liability_items = financial_summary.get("total_liability_items", 0)
+        # Общее количество позиций в минусах (сумма quantity)
+        total_items = sum(op.get("quantity", 0) for op in disposal_operations)
         
-        # === Собираем ссылки из trouble_result (если есть) ===
+        # Общая сумма минусов (чистая финансовая ответственность)
+        total_value = financial_summary.get("total_liability_value", 0.0)
+        
+        # === Отладка: что именно попадает в отчёт ===
+        print(f"\n[Telegram] 📊 Данные для отчёта:")
+        print(f"    plan существует: {plan is not None}")
+        print(f"    DISPOSAL операций: {len(disposal_operations)}")
+        for i, op in enumerate(disposal_operations, 1):
+            print(f"      [{i}] {op.get('product_title')} × {op.get('quantity')} шт")
+        print(f"    ИТОГО: {total_types} видов, {total_items} позиций, {total_value:.2f}₽")
+        
+        # === 2. Данные из trouble_result (ВСЕ ссылки, не только "на проверке") ===
         all_ref = []
         if trouble_result:
-            all_ref = trouble_result.get("allRef", []) or []
-        
-        # Уникальные ссылки
+            # Берём ссылки из trouble_operations — там ВСЕ товары с причинами,
+            # независимо от того "к оплате" или "на проверке"
+            trouble_ops = trouble_result.get("trouble_operations", []) or []
+            for op in trouble_ops:
+                ref = op.get("reference", "").strip()
+                if ref:  # только если ссылка указана
+                    all_ref.append({
+                        "product_title": op.get("product_title") or "Товар",
+                        "product_id": op.get("product_id"),
+                        "reference": ref,
+                        "quantity": op.get("quantity", 0),
+                        "value": op.get("cost", 0) * op.get("quantity", 0),
+                        "reason": op.get("reason", ""),
+                    })
+            
+            # Также добавляем из allRef (для обратной совместимости)
+            existing_ids = {r.get("product_id") for r in all_ref}
+            for ref in trouble_result.get("allRef", []) or []:
+                if ref.get("product_id") not in existing_ids:
+                    all_ref.append(ref)
+
+        items_on_check = len(all_ref)
         unique_refs = list(set(
             r.get("reference") for r in all_ref 
             if r.get("reference")
         ))
         links_count = len(unique_refs)
-        items_on_check = len(all_ref)
         
-        # === 1. Сохраняем refStateGeneral (всегда) ===
+        # === 3. Сохраняем в БД ===
         try:
             repo = RefStateRepository()
             general_data = {
                 "point_name": point_name,
                 "administrator": administrator,
                 "session_label": session_label,
-                "total_types": len(set(p.title for p in all_products if p.actual is not None)),
-                "total_items": counted_products,
-                "total_value": total_liability,
+                "total_types": total_types,
+                "total_items": total_items,
+                "total_value": total_value,
                 "items_on_check": items_on_check,
                 "links_count": links_count,
                 "pdf_path": pdf_path,
             }
             general_result = repo.save_general(general_data)
             
-            # === 2. Сохраняем refStateDetailed (только если есть ссылки) ===
             if general_result.get("success") and all_ref:
                 general_id = general_result["id"]
-                detailed_items = []
-                for ref in all_ref:
-                    detailed_items.append({
+                detailed_items = [
+                    {
                         "administrator": administrator,
-                        "product_title": ref.get("product_title") or ref.get("title") or "—",
-                        "product_id": ref.get("product_id"),
-                        "reference": ref.get("reference") or "",
-                        "quantity": ref.get("quantity", 0),
-                        "value": ref.get("value", 0),
-                        "reason": ref.get("reason") or "",
-                    })
+                        "product_title": r.get("product_title") or "—",
+                        "product_id": r.get("product_id"),
+                        "reference": r.get("reference") or "",
+                        "quantity": r.get("quantity", 0),
+                        "value": r.get("value", 0),
+                        "reason": r.get("reason") or "",
+                    }
+                    for r in all_ref
+                ]
                 repo.save_detailed(general_id, detailed_items)
         except Exception as e:
-            print(f"[RefState] ✗ Ошибка сохранения в БД: {e}")
-            import traceback; traceback.print_exc()
+            print(f"[RefState] ✗ Ошибка БД: {e}")
         
-        # === 3. Формируем текст отчёта ===
-        mood_emoji, _ = self._get_mood_emoji(less_count)
-        
+        # === 4. Текст СТРОГО ПО ШАБЛОНУ ===
         lines = [
-            f"<b>📋 Отчёт о смене</b>",
-            f"<b>{date_str}</b> • {administrator}",
-            f"📍 <b>{point_name}</b> ({session_label})",
+            f"{date_str} {administrator}",
+            f"{total_types} видов, {total_items} позиций, {total_value:.2f}₽",
+            f"Переданные товары на проверку: {items_on_check}",
             "",
-            f"📊 <b>Итоги:</b>",
-            f"• Всего товаров: <b>{total_products}</b>",
-            f"• Посчитано: <b>{counted_products}</b>",
-            f"• Сходится: <b>{equal_count}</b>",
-            f"• Недостача: <b>{less_count}</b> {mood_emoji}",
-            f"• Избыток: <b>{more_count}</b>",
+            "Ссылки:",
         ]
         
-        # Финансовая ответственность (только если есть)
-        if total_liability > 0:
-            lines.append("")
-            lines.append(f"💰 <b>К возмещению:</b> {total_liability:.2f}₽ ({total_liability_items} шт)")
-        
-        # Товары на проверке (только если есть ссылки)
-        if items_on_check > 0:
-            lines.append("")
-            lines.append(f"🔍 <b>Товары на проверке:</b> {items_on_check}")
-            lines.append(f"🔗 <b>Ссылок:</b> {links_count}")
-            lines.append("")
-            lines.append("<b>Ссылки:</b>")
-            for ref in sorted(unique_refs):
-                lines.append(f"• {ref}")
+        # Ссылки в формате: • <группа> (<кол-во> шт): <ссылка>
+        if all_ref:
+            for ref in all_ref:
+                title = ref.get("product_title") or "Товар"
+                qty = ref.get("quantity", 0)
+                link = ref.get("reference") or "—"
+                lines.append(f"• {title} ({qty} шт): {link}")
+        else:
+            lines.append("—")
         
         message = "\n".join(lines)
         
-        # === 4. Отправляем в Telegram (ВСЕГДА, даже без PDF) ===
+        # === 5. Печатаем текст для проверки ===
+        print(f"\n[Telegram] 📝 Текст отчёта:\n{'─'*40}")
+        print(message)
+        print(f"{'─'*40}")
+        
+        # === 6. Отправляем в Telegram (с PDF) ===
         try:
             telegram = TelegramService()
             telegram.send_ref_state_report(
                 point_name=point_name,
                 administrator=administrator,
                 date_str=date_str,
-                total_types=len(set(p.title for p in all_products if p.actual is not None)),
-                total_items=counted_products,
-                total_value=total_liability,
+                total_types=total_types,
+                total_items=total_items,
+                total_value=total_value,
                 items_on_check=items_on_check,
                 references=unique_refs,
                 pdf_path=pdf_path,
             )
         except Exception as e:
-            print(f"[Telegram] ✗ Ошибка отправки: {e}")
-            import traceback; traceback.print_exc()
-
+            print(f"[Telegram] ✗ Ошибка: {e}")
     # ============================================================
     #  🔒 БЕЗОПАСНОЕ ЗАКРЫТИЕ ПЕРЕСЧЁТА
     # ============================================================
@@ -1378,6 +1404,7 @@ class InventoryWindow(QMainWindow):
                         all_products=all_products,
                         pdf_path=pdf_path,
                         financial_summary=financial_summary,
+                        plan=plan,
                     )
                 except Exception as e:
                     print(f"[RefState/Telegram] ✗ Ошибка (не критично): {e}")
