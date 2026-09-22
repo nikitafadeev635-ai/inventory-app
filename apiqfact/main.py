@@ -1582,6 +1582,203 @@ async def save_correct_trouble(
         raise HTTPException(500, f"Database error: {str(e)}")
 
 # ============================================================
+# 🆕 v1.4.0: МОДЕЛИ ДЛЯ refState (товары на проверке со ссылками)
+# ============================================================
+class RefStateGeneralRequest(BaseModel):
+    """Общий отчёт о товарах на ручной проверке."""
+    point_name: str
+    administrator: str = Field(..., max_length=255)
+    session_label: str = Field(default="", max_length=255)
+    total_types: int = 0
+    total_items: int = 0
+    total_value: float = Field(default=0.0, ge=0)
+    items_on_check: int = 0
+    links_count: int = 0
+    pdf_path: str = Field(default=None, max_length=500)
+
+
+class RefStateDetailedItem(BaseModel):
+    """Одна запись детализации (товар + ссылка)."""
+    administrator: str = Field(..., max_length=255)
+    product_title: str = Field(..., max_length=500)
+    product_id: int = None
+    reference: str = Field(..., max_length=500)
+    quantity: int = Field(default=0, ge=0)
+    value: float = Field(default=0.0, ge=0)
+    reason: str = Field(default="", max_length=255)
+
+
+class RefStateDetailedRequest(BaseModel):
+    """Пакет детализации для одного отчёта."""
+    general_id: int
+    items: list[RefStateDetailedItem]
+
+
+class TelegramRefStateRequest(BaseModel):
+    """Запрос на отправку refState-отчёта в Telegram."""
+    point_name: str
+    message: str
+    parse_mode: str = "HTML"
+
+# ============================================================
+# 🆕 v1.5.0: refState — сохранение отчётов о товарах на проверке
+# ============================================================
+@app.post("/api/ref-state/general")
+async def save_ref_state_general(
+    req: RefStateGeneralRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Сохраняет общий отчёт в refStateGeneral."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO refStateGeneral 
+                   (point_name, administrator, session_label, total_types,
+                    total_items, total_value, items_on_check, links_count, pdf_path)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    req.point_name,
+                    req.administrator,
+                    req.session_label,
+                    req.total_types,
+                    req.total_items,
+                    req.total_value,
+                    req.items_on_check,
+                    req.links_count,
+                    req.pdf_path,
+                ),
+            )
+            conn.commit()
+            new_id = cur.lastrowid
+        
+        log_audit({
+            "faname": user["faname"],
+            "point_name": req.point_name,
+            "warehouse_id": user["warehouse_id"],
+            "operation_type": "REF_STATE_GENERAL_SAVE",
+            "product_count": req.items_on_check,
+            "ip": request.client.host,
+            "user_agent": request.headers.get("user-agent", ""),
+            "details": {
+                "administrator": req.administrator,
+                "session_label": req.session_label,
+                "total_types": req.total_types,
+                "total_items": req.total_items,
+                "total_value": req.total_value,
+                "links_count": req.links_count,
+            },
+        })
+        
+        logger.info(
+            f"✓ Saved refStateGeneral (id={new_id}) for {req.administrator} @ {req.point_name}: "
+            f"{req.items_on_check} товаров, {req.links_count} ссылок ({req.session_label})"
+        )
+        return {"success": True, "id": new_id}
+    except Exception as e:
+        logger.error(f"✗ Save refStateGeneral error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Database error: {str(e)}")
+
+
+@app.post("/api/ref-state/detailed")
+async def save_ref_state_detailed(
+    req: RefStateDetailedRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Сохраняет детализацию (каждая ссылка по товару) в refStateDetailed."""
+    if not req.items:
+        return {"success": True, "inserted": 0, "message": "Нет записей"}
+    
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            inserted = 0
+            for item in req.items:
+                cur.execute(
+                    """INSERT INTO refStateDetailed 
+                       (general_id, administrator, product_title, product_id,
+                        reference, quantity, value, reason)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        req.general_id,
+                        item.administrator,
+                        item.product_title,
+                        item.product_id,
+                        item.reference,
+                        item.quantity,
+                        item.value,
+                        item.reason,
+                    ),
+                )
+                inserted += 1
+            conn.commit()
+        
+        log_audit({
+            "faname": user["faname"],
+            "point_name": user["point_name"],
+            "warehouse_id": user["warehouse_id"],
+            "operation_type": "REF_STATE_DETAILED_SAVE",
+            "product_count": inserted,
+            "ip": request.client.host,
+            "user_agent": request.headers.get("user-agent", ""),
+            "details": {
+                "general_id": req.general_id,
+                "items_count": inserted,
+            },
+        })
+        
+        logger.info(
+            f"✓ Saved {inserted} refStateDetailed records (general_id={req.general_id})"
+        )
+        return {"success": True, "inserted": inserted}
+    except Exception as e:
+        logger.error(f"✗ Save refStateDetailed error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Database error: {str(e)}")
+
+
+# ============================================================
+# 🆕 v1.5.0: Telegram — отправка refState-отчётов по топикам
+# ============================================================
+@app.post("/api/telegram/send-ref-state")
+async def send_ref_state_telegram(
+    req: TelegramRefStateRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Отправляет refState-отчёт в Telegram топик конкретной точки.
+    Использует send_telegram_to_topic() для маршрутизации по филиалу.
+    """
+    result = await send_telegram_to_topic(
+        point_name=req.point_name,
+        message=req.message,
+        parse_mode=req.parse_mode,
+    )
+    
+    if result["success"]:
+        log_audit({
+            "faname": user["faname"],
+            "point_name": req.point_name,
+            "warehouse_id": user["warehouse_id"],
+            "operation_type": "TELEGRAM_REF_STATE_SEND",
+            "product_count": 0,
+            "ip": request.client.host,
+            "user_agent": request.headers.get("user-agent", ""),
+            "details": {
+                "message_id": result.get("message_id"),
+                "message_length": len(req.message),
+            },
+        })
+    
+    return result
+
+# ============================================================
 #  ЗАПУСК
 # ============================================================
 if __name__ == "__main__":
