@@ -28,27 +28,52 @@ class TelegramService:
         items_on_check: int,
         references: list,
         pdf_path: str = None,
+        check_value: float = 0.0,     # 🆕 сумма товаров на проверке
+        pay_value: float = 0.0,       # 🆕 к возмещению
+        all_ref: list = None,         # 🆕 детали ссылок
     ) -> dict:
         """
-        Отправляет отчёт о товарах на проверке в Telegram.
-        Если pdf_path указан — отправляет PDF с подписью.
-        Иначе — просто текстовое сообщение.
+        Отправляет отчёт с финансовой разбивкой:
+        - Предварительный минус (total_value)
+        - Товары на проверке (check_value)
+        - К возмещению (pay_value)
         """
-        # Формируем текст сообщения
+        # 🆕 Формируем текст СТРОГО ПО ШАБЛОНУ
         lines = [
-            f"<b>{date_str}</b> {administrator}",
-            f"<b>{total_types}</b> видов, <b>{total_items}</b> позиций, "
-            f"<b>{total_value:.2f}₽</b>",
-            f"Переданные товары на проверку: <b>{items_on_check}</b>",
-            "",
-            "<b>Ссылки:</b>",
+            f"{date_str} {administrator}",
+            f"{total_types} видов, {total_items} позиций, {total_value:.2f}₽",
+            f"Предварительный минус: {total_value:.2f}₽",
         ]
-        unique_refs = sorted(set(ref for ref in references if ref))
-        for ref in unique_refs:
-            lines.append(f"• {ref}")
+        
+        # Строка "Товары на проверке"
+        if items_on_check > 0:
+            lines.append(f"Товары на проверке: {check_value:.2f}₽ ({items_on_check} шт)")
+        else:
+            lines.append(f"Товары на проверке: 0.00₽ (0 шт)")
+        
+        # Строка "К возмещению"
+        lines.append(f"К возмещению: {pay_value:.2f}₽")
+        lines.append("")
+        lines.append("Ссылки:")
+        
+        # Ссылки с деталями: группа (кол-во шт): ссылка
+        if all_ref:
+            for ref in all_ref:
+                title = ref.get("product_title") or "Товар"
+                qty = ref.get("quantity", 0)
+                link = ref.get("reference") or "—"
+                lines.append(f"• {title} ({qty} шт): {link}")
+        else:
+            lines.append("—")
+        
         message = "\n".join(lines)
         
-        # Если есть PDF — отправляем как документ с caption
+        # Печатаем для отладки
+        print(f"[Telegram] 📝 Финальный текст:\n{'─'*40}")
+        print(message)
+        print(f"{'─'*40}")
+        
+        # Отправка
         if pdf_path and os.path.exists(pdf_path):
             return self._send_with_pdf(point_name, message, pdf_path)
         else:

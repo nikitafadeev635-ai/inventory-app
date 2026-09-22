@@ -1045,36 +1045,50 @@ class InventoryWindow(QMainWindow):
             print(f"      [{i}] {op.get('product_title')} × {op.get('quantity')} шт")
         print(f"    ИТОГО: {total_types} видов, {total_items} позиций, {total_value:.2f}₽")
         
-        # === 2. Данные из trouble_result (ВСЕ ссылки, не только "на проверке") ===
+        # === 2. Данные из trouble_result (товары на проверке) ===
         all_ref = []
         if trouble_result:
-            # Берём ссылки из trouble_operations — там ВСЕ товары с причинами,
-            # независимо от того "к оплате" или "на проверке"
+            # Берём ссылки из trouble_operations — там ВСЕ товары с причинами
             trouble_ops = trouble_result.get("trouble_operations", []) or []
             for op in trouble_ops:
                 ref = op.get("reference", "").strip()
                 if ref:  # только если ссылка указана
+                    qty = op.get("quantity", 0)
+                    cost = op.get("cost", 0)
                     all_ref.append({
                         "product_title": op.get("product_title") or "Товар",
                         "product_id": op.get("product_id"),
                         "reference": ref,
-                        "quantity": op.get("quantity", 0),
-                        "value": op.get("cost", 0) * op.get("quantity", 0),
+                        "quantity": qty,
+                        "value": cost * qty,  # стоимость этого товара × кол-во
                         "reason": op.get("reason", ""),
                     })
             
-            # Также добавляем из allRef (для обратной совместимости)
+            # Добавляем из allRef (обратная совместимость)
             existing_ids = {r.get("product_id") for r in all_ref}
             for ref in trouble_result.get("allRef", []) or []:
                 if ref.get("product_id") not in existing_ids:
                     all_ref.append(ref)
-
+        
         items_on_check = len(all_ref)
+        
+        # 🆕 Сумма товаров на проверке
+        check_value = sum(r.get("value", 0) for r in all_ref)
+        
+        # 🆕 Итог к возмещению = общий минус - товары на проверке
+        pay_value = max(0.0, total_value - check_value)
+        
         unique_refs = list(set(
             r.get("reference") for r in all_ref 
             if r.get("reference")
         ))
         links_count = len(unique_refs)
+        
+        # Отладка
+        print(f"    💰 Финансовая разбивка:")
+        print(f"      Предварительный минус: {total_value:.2f}₽")
+        print(f"      Товары на проверке:    {check_value:.2f}₽ ({items_on_check} шт)")
+        print(f"      К возмещению:          {pay_value:.2f}₽")
         
         # === 3. Сохраняем в БД ===
         try:
@@ -1149,6 +1163,10 @@ class InventoryWindow(QMainWindow):
                 items_on_check=items_on_check,
                 references=unique_refs,
                 pdf_path=pdf_path,
+                # 🆕 новые параметры для финансовой разбивки
+                check_value=check_value,
+                pay_value=pay_value,
+                all_ref=all_ref,  # 🆕 все ссылки с деталями
             )
         except Exception as e:
             print(f"[Telegram] ✗ Ошибка: {e}")

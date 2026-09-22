@@ -23,7 +23,7 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
-
+import bcrypt
 import jwt
 import httpx
 import pymysql
@@ -364,13 +364,34 @@ def get_db_connection():
 
 
 def verify_employee(faname: str, password: str) -> bool:
-    """Проверяет пароль сотрудника в БД."""
+    """Проверяет пароль сотрудника через bcrypt."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("SELECT password FROM employees WHERE faname = %s", (faname,))
             row = cur.fetchone()
-            return bool(row) and row["password"] == password
+            if not row:
+                return False
+            
+            stored_password = row["password"]
+            
+            # Проверяем, является ли пароль bcrypt хешем
+            if stored_password.startswith('$2b$') or \
+               stored_password.startswith('$2a$') or \
+               stored_password.startswith('$2y$'):
+                # Новый формат: bcrypt хеш
+                try:
+                    return bcrypt.checkpw(
+                        password.encode('utf-8'),
+                        stored_password.encode('utf-8')
+                    )
+                except Exception as e:
+                    logger.error(f"bcrypt error for {faname}: {e}")
+                    return False
+            else:
+                # Старый формат: plaintext (обратная совместимость)
+                logger.warning(f"⚠️ {faname} использует plaintext пароль!")
+                return stored_password == password
     except Exception as e:
         logger.error(f"DB error: {e}")
         return False
@@ -875,11 +896,12 @@ async def login(req: LoginRequest, request: Request):
 async def verify_password(request: Request):
     """
     Проверяет пароль конкретного сотрудника БЕЗ выдачи JWT.
+    Поддерживает как bcrypt-хеши (новый формат), так и plaintext (обратная совместимость).
     """
     try:
         data = await request.json()
         faname = data.get("faname", "").strip()
-        password = data.get("password", "").strip()
+        password = data.get("password", "")  # без .strip() чтобы пробелы в пароле учитывались
         
         if not faname or not password:
             return {"verified": False, "error": "Не указан ФИО или пароль"}
@@ -909,11 +931,37 @@ async def verify_password(request: Request):
         db_faname = row["faname"]
         db_password = row["password"]
         
-        if db_password == password:
-            logger.info(f"[Auth] ✓ Пароль верен для: {faname}")
+        # === 🆕 Проверка пароля с поддержкой bcrypt ===
+        is_valid = False
+        
+        # Определяем формат пароля
+        if (db_password.startswith('$2b$') or 
+            db_password.startswith('$2a$') or 
+            db_password.startswith('$2y$')):
+            # Новый формат: bcrypt хеш
+            try:
+                is_valid = bcrypt.checkpw(
+                    password.encode('utf-8'),
+                    db_password.encode('utf-8')
+                )
+                if is_valid:
+                    logger.info(f"[Auth] ✓ Пароль верен (bcrypt): {faname}")
+                else:
+                    logger.warning(f"[Auth] ✗ Неверный пароль (bcrypt): {faname}")
+            except Exception as e:
+                logger.error(f"[Auth] bcrypt error для {faname}: {e}")
+                is_valid = False
+        else:
+            # Старый формат: plaintext (обратная совместимость)
+            is_valid = db_password == password
+            if is_valid:
+                logger.warning(f"[Auth] ⚠ {faname} использует plaintext пароль! Запустите migrate_passwords.py")
+            else:
+                logger.warning(f"[Auth] ✗ Неверный пароль (plaintext): {faname}")
+        
+        if is_valid:
             return {"verified": True, "faname": db_faname}
         else:
-            logger.warning(f"[Auth] ✗ Неверный пароль для: {faname}")
             return {"verified": False, "error": "Неверный пароль"}
     
     except Exception as e:
@@ -921,7 +969,6 @@ async def verify_password(request: Request):
         import traceback
         traceback.print_exc()
         return {"verified": False, "error": str(e)}
-
 
 # ------------------------------------------------------------
 #  Список товаров
