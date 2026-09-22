@@ -34,6 +34,9 @@ from fastapi.responses import JSONResponse
 from fastapi import UploadFile, File, Form
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+import ipaddress
+from collections import defaultdict
+import time
 
 # Загружаем конфиг
 load_dotenv()
@@ -228,40 +231,162 @@ app = FastAPI(
     openapi_url="/openapi.json" if is_dev else None,
 )
 
+
+# ============================================================
+# IP-WHITELIST: загрузка разрешённых IP
+# ============================================================
+ALLOWED_IPS_RAW = os.getenv("ALLOWED_IPS", "")
+ADMIN_IPS_RAW = os.getenv("ADMIN_IPS", "")
+ALERT_ON_BLOCKED_IP = os.getenv("ALERT_ON_BLOCKED_IP", "true").lower() == "true"
+
+ALLOWED_NETWORKS = []
+ADMIN_NETWORKS = []
+
+def _parse_ip_list(raw: str) -> list:
+    """Парсит строку с IP/CIDR в список ip_network объектов."""
+    networks = []
+    for ip_range in raw.split(","):
+        ip_range = ip_range.strip()
+        if not ip_range:
+            continue
+        try:
+            if "/" in ip_range:
+                networks.append(ipaddress.ip_network(ip_range, strict=False))
+            else:
+                networks.append(ipaddress.ip_network(f"{ip_range}/32", strict=False))
+        except Exception as e:
+            logger.warning(f"[Security] ⚠ Неверный IP/CIDR: {ip_range}: {e}")
+    return networks
+
+ALLOWED_NETWORKS = _parse_ip_list(ALLOWED_IPS_RAW)
+ADMIN_NETWORKS = _parse_ip_list(ADMIN_IPS_RAW)
+
+if ALLOWED_NETWORKS:
+    logger.info(f"[Security] ✅ IP-whitelist активен: {len(ALLOWED_NETWORKS)} адресов")
+    for net in ALLOWED_NETWORKS:
+        logger.info(f"[Security]   → {net}")
+else:
+    logger.warning("[Security] ⚠ IP-whitelist отключён (ALLOWED_IPS пустой)")
+
+# Счётчик заблокированных IP для rate limiting алертов
+_blocked_ip_tracker = defaultdict(list)  # ip -> [timestamps]
+
 # ============================================================
 #  API SECRET KEY — защита от несанкционированного доступа
 # ============================================================
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
 
 
+# ============================================================
+# 🔒 MIDDLEWARE: IP-whitelist + API-Key защита
+# ============================================================
 @app.middleware("http")
-async def check_api_key(request: Request, call_next):
-    """Проверяет наличие API Secret Key в заголовке X-API-Key."""
-    # 1. Health-check всегда доступен (для мониторинга)
-    if request.url.path == "/":
+async def security_middleware(request: Request, call_next):
+    """
+    Трёхуровневая защита:
+    1. IP-whitelist (разрешены только IP филиалов)
+    2. API-Key (проверка секрета клиента)
+    3. JWT (проверка авторизации пользователя — в отдельных эндпоинтах)
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    path = request.url.path
+    
+    # === Уровень 0: Healthcheck открыт всем (для мониторинга) ===
+    if path == "/":
         return await call_next(request)
     
-    # 2. Если API_SECRET_KEY не настроен — пропускаем (dev режим)
-    if not API_SECRET_KEY:
-        return await call_next(request)
+    # === Уровень 1: Проверка IP ===
+    if ALLOWED_NETWORKS or ADMIN_NETWORKS:
+        try:
+            client_addr = ipaddress.ip_address(client_ip)
+            is_allowed = any(client_addr in net for net in ALLOWED_NETWORKS)
+            is_admin = any(client_addr in net for net in ADMIN_NETWORKS)
+        except ValueError:
+            is_allowed = False
+            is_admin = False
+            logger.warning(f"[Security] ⚠ Неверный IP формат: {client_ip}")
+        
+        if not (is_allowed or is_admin):
+            # IP не в белом списке — блокируем
+            logger.warning(
+                f"🚫 [Security] BLOCKED: {client_ip} → {request.method} {path} "
+                f"(IP not in whitelist)"
+            )
+            
+            # Отправляем алерт в Telegram (с rate limiting)
+            if ALERT_ON_BLOCKED_IP:
+                await _send_blocked_ip_alert(client_ip, path, request.method)
+            
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "Access denied: your IP is not allowed",
+                    "ip": client_ip,
+                }
+            )
+        
+        if is_admin:
+            logger.debug(f"[Security] 👑 Admin access: {client_ip} → {path}")
     
-    # 3. Проверяем заголовок X-API-Key
-    api_key = request.headers.get("X-API-Key")
-    if api_key != API_SECRET_KEY:
-        logger.warning(
-            f"🚫 Заблокирован запрос без API key: "
-            f"{request.client.host} → {request.method} {request.url.path}"
-        )
-        return JSONResponse(
-            status_code=401,
-            content={
-                "detail": "Invalid or missing API key",
-                "hint": "Требуется заголовок X-API-Key"
-            }
-        )
+    # === Уровень 2: Проверка API-Key ===
+    if API_SECRET_KEY:
+        api_key = request.headers.get("X-API-Key")
+        if api_key != API_SECRET_KEY:
+            logger.warning(
+                f"🚫 [Security] Invalid API key from {client_ip} → {path}"
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key"}
+            )
     
-    # 4. Всё ок — пропускаем запрос дальше
+    # Всё ок — пропускаем запрос дальше
     return await call_next(request)
+
+
+async def _send_blocked_ip_alert(ip: str, path: str, method: str):
+    """
+    Отправляет алерт в Telegram о попытке доступа с неразрешённого IP.
+    С rate limiting: максимум 1 алерт в 5 минут с одного IP.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    
+    now = time.time()
+    # Очищаем старые записи (старше 5 минут)
+    _blocked_ip_tracker[ip] = [
+        t for t in _blocked_ip_tracker[ip] if now - t < 300
+    ]
+    
+    # Если уже был алерт за последние 5 минут — не шлём
+    if _blocked_ip_tracker[ip]:
+        return
+    
+    _blocked_ip_tracker[ip].append(now)
+    
+    # Формируем сообщение
+    message = (
+        f"🚨 <b>ПОПЫТКА ВЗЛОМА!</b>\n\n"
+        f"🌐 <b>IP:</b> <code>{ip}</code>\n"
+        f"📍 <b>Запрос:</b> {method} {path}\n"
+        f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+        f"<i>IP не в белом списке. Если это вы — добавьте IP в .env "
+        f"(переменная ALLOWED_IPS или ADMIN_IPS)</i>"
+    )
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                }
+            )
+            logger.info(f"[Security] 📨 Telegram-алерт отправлен для IP {ip}")
+    except Exception as e:
+        logger.error(f"[Security] ✗ Ошибка отправки алерта: {e}")
 
 security = HTTPBearer()
 
