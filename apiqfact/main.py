@@ -11,11 +11,17 @@ v1.3.0 — Пакетная обработка:
 - Автоматическое разбиение на батчи по 25 товаров
 - Экономия rate limit (1 запрос вместо N)
 
+v1.6.0 — Безопасность:
+- IP-whitelist + Telegram-алерты при попытках взлома
+- Rate limiting на /api/auth/* (5 попыток за 15 минут)
+- bcrypt хеширование паролей сотрудников
+
 Временно отключены (для безопасности):
 - Поиск клиентов по телефону
 - Корректировка депозита
 """
 import os
+import io
 import json
 import time
 import logging
@@ -28,15 +34,14 @@ import jwt
 import httpx
 import pymysql
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-from fastapi import UploadFile, File, Form
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 import ipaddress
 from collections import defaultdict
-import time
+
+from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 # Загружаем конфиг
 load_dotenv()
@@ -87,7 +92,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # 🆕 v1.4.0: Mapping точка → topic_id для рассылки отчётов по филиалам
-# Базовые значения в коде, можно переопределить через .env
 TELEGRAM_TOPIC_MAP = {
     "Русская": int(os.getenv("TELEGRAM_TOPIC_RUSSKAYA", "4")),
     "Сахалинская": int(os.getenv("TELEGRAM_TOPIC_SAHALINSKAYA", "9")),
@@ -99,73 +103,42 @@ TELEGRAM_TOPIC_MAP = {
 
 
 async def send_telegram_alert(message: str):
-    """
-    Отправляет критические уведомления (crash-логи) в общий чат супергруппы.
-    Используется для алертов которые должны видеть ВСЕ филиалы.
-    """
+    """Отправляет критические уведомления (crash-логи) в общий чат супергруппы."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("[Telegram] ⚠ Не настроен бот или chat_id — пропуск")
         return
     
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        # 🆕 v1.4.0: Убрали TELEGRAM_TOPIC_ID — теперь алерты идут в основной чат супергруппы
-        # (без message_thread_id — сообщение попадает в general чат, а не в конкретный топик)
         
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(url, json=payload)
-            
             if r.status_code == 200:
                 logger.info("[Telegram] ✓ Уведомление отправлено")
             else:
                 logger.error(f"[Telegram] ✗ HTTP {r.status_code}: {r.text[:200]}")
-    
     except Exception as e:
         logger.error(f"[Telegram] ✗ Ошибка отправки: {e}")
 
 
 async def send_telegram_to_topic(point_name: str, message: str, parse_mode: str = "HTML") -> dict:
-    """
-    🆕 v1.4.0: Отправляет сообщение в конкретный топик супергруппы
-    в зависимости от точки (филиала).
-    
-    Используется для отчётов refState — каждый филиал получает
-    только свои товары на проверке в свой топик.
-    
-    Args:
-        point_name: Название точки ("Русская", "Сахалинская" и т.д.)
-        message: Текст сообщения (поддерживает HTML если parse_mode="HTML")
-        parse_mode: "HTML" или "Markdown"
-    
-    Returns:
-        {"success": bool, "message_id": int|None, "error": str|None}
-    """
-    # Проверка базовой конфигурации
+    """Отправляет сообщение в конкретный топик супергруппы."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("[Telegram] ⚠ Не настроен бот или chat_id — пропуск")
         return {"success": False, "error": "bot/chat_id not configured"}
     
-    # Получаем topic_id для точки
     topic_id = TELEGRAM_TOPIC_MAP.get(point_name)
-    
-    # 🆕 Валидация: topic_id должен быть положительным числом
-    # (0 или None = топик не настроен)
     if not topic_id or topic_id <= 0:
         logger.warning(
-            f"[Telegram] ⚠ Нет валидного topic_id для точки '{point_name}' "
-            f"(получено: {topic_id}). Доступные: {list(TELEGRAM_TOPIC_MAP.keys())}"
+            f"[Telegram] ⚠ Нет валидного topic_id для точки '{point_name}'"
         )
-        return {
-            "success": False, 
-            "error": f"no valid topic_id for '{point_name}'"
-        }
+        return {"success": False, "error": f"no valid topic_id for '{point_name}'"}
     
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -189,19 +162,13 @@ async def send_telegram_to_topic(point_name: str, message: str, parse_mode: str 
                 )
                 return {"success": True, "message_id": message_id, "error": None}
             
-            # Telegram вернул ошибку — разбираем причину
             error_text = r.text[:300]
             logger.error(
-                f"[Telegram] ✗ HTTP {r.status_code} для точки '{point_name}' "
-                f"(topic_id={topic_id}): {error_text}"
+                f"[Telegram] ✗ HTTP {r.status_code} для точки '{point_name}': {error_text}"
             )
             
-            # Специфичные ошибки Telegram
             if r.status_code == 400 and "message_thread_id" in error_text.lower():
-                return {
-                    "success": False,
-                    "error": f"Invalid topic_id {topic_id} for point '{point_name}'"
-                }
+                return {"success": False, "error": f"Invalid topic_id {topic_id}"}
             if r.status_code == 401:
                 return {"success": False, "error": "Invalid bot token"}
             
@@ -210,22 +177,19 @@ async def send_telegram_to_topic(point_name: str, message: str, parse_mode: str 
     except httpx.TimeoutException:
         logger.error(f"[Telegram] ✗ Таймаут отправки в топик {point_name}")
         return {"success": False, "error": "timeout"}
-    
     except Exception as e:
         logger.error(f"[Telegram] ✗ Ошибка отправки в топик '{point_name}': {e}")
-        import traceback
-        traceback.print_exc()
         return {"success": False, "error": str(e)}
+
 
 # ============================================================
 #  FASTAPI APP
 # ============================================================
-# 🛡️ Отключаем документацию в production (если DEBUG=false)
 is_dev = os.getenv("DEBUG", "false").lower() == "true"
 
 app = FastAPI(
     title="QFact API",
-    version="1.3.0",
+    version="1.6.0",
     docs_url="/docs" if is_dev else None,
     redoc_url="/redoc" if is_dev else None,
     openapi_url="/openapi.json" if is_dev else None,
@@ -233,14 +197,11 @@ app = FastAPI(
 
 
 # ============================================================
-# IP-WHITELIST: загрузка разрешённых IP
+# 🔒 IP-WHITELIST: загрузка разрешённых IP
 # ============================================================
 ALLOWED_IPS_RAW = os.getenv("ALLOWED_IPS", "")
 ADMIN_IPS_RAW = os.getenv("ADMIN_IPS", "")
 ALERT_ON_BLOCKED_IP = os.getenv("ALERT_ON_BLOCKED_IP", "true").lower() == "true"
-
-ALLOWED_NETWORKS = []
-ADMIN_NETWORKS = []
 
 def _parse_ip_list(raw: str) -> list:
     """Парсит строку с IP/CIDR в список ip_network объектов."""
@@ -269,7 +230,111 @@ else:
     logger.warning("[Security] ⚠ IP-whitelist отключён (ALLOWED_IPS пустой)")
 
 # Счётчик заблокированных IP для rate limiting алертов
-_blocked_ip_tracker = defaultdict(list)  # ip -> [timestamps]
+_blocked_ip_tracker = defaultdict(list)
+
+
+# ============================================================
+# 🔒 RATE LIMITING: защита от брутфорса паролей
+# ============================================================
+RATE_LIMIT_MAX_ATTEMPTS = int(os.getenv("RATE_LIMIT_MAX_ATTEMPTS", "5"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "900"))       # 15 минут
+RATE_LIMIT_LOCKOUT = int(os.getenv("RATE_LIMIT_LOCKOUT", "900"))      # 15 минут
+
+# Счётчики: {(ip, faname): [timestamp1, timestamp2, ...]}
+_login_attempts = defaultdict(list)
+_blocked_users = {}  # {(ip, faname): timestamp_разблокировки}
+
+
+def _check_rate_limit(client_ip: str, faname: str) -> tuple:
+    """
+    Проверяет не превышен ли лимит попыток.
+    Returns: (is_allowed: bool, seconds_until_unlock: int)
+    """
+    now = time.time()
+    key = (client_ip, faname)
+    
+    # 1. Проверка жёсткой блокировки
+    if key in _blocked_users:
+        unlock_at = _blocked_users[key]
+        if now < unlock_at:
+            return False, int(unlock_at - now)
+        else:
+            # Срок блокировки истёк — очищаем
+            del _blocked_users[key]
+            if key in _login_attempts:
+                del _login_attempts[key]
+    
+    # 2. Очистка старых попыток (старше RATE_LIMIT_WINDOW)
+    if key in _login_attempts:
+        _login_attempts[key] = [
+            t for t in _login_attempts[key]
+            if now - t < RATE_LIMIT_WINDOW
+        ]
+    
+    # 3. Проверка количества попыток
+    attempts_count = len(_login_attempts.get(key, []))
+    if attempts_count >= RATE_LIMIT_MAX_ATTEMPTS:
+        _blocked_users[key] = now + RATE_LIMIT_LOCKOUT
+        return False, RATE_LIMIT_LOCKOUT
+    
+    return True, 0
+
+
+def _register_failed_attempt(client_ip: str, faname: str):
+    """Регистрирует неудачную попытку входа."""
+    key = (client_ip, faname)
+    _login_attempts[key].append(time.time())
+    attempts_count = len(_login_attempts[key])
+    
+    logger.warning(
+        f"[Security] ✗ Неудачная попытка #{attempts_count}/{RATE_LIMIT_MAX_ATTEMPTS}: "
+        f"{faname} @ {client_ip}"
+    )
+    
+    if attempts_count >= RATE_LIMIT_MAX_ATTEMPTS:
+        _blocked_users[key] = time.time() + RATE_LIMIT_LOCKOUT
+        logger.error(
+            f"[Security] 🚨 БЛОКИРОВКА: {faname} @ {client_ip} "
+            f"на {RATE_LIMIT_LOCKOUT // 60} минут"
+        )
+
+
+def _reset_attempts(client_ip: str, faname: str):
+    """Сбрасывает счётчик после успешного входа."""
+    key = (client_ip, faname)
+    _login_attempts.pop(key, None)
+    _blocked_users.pop(key, None)
+
+
+async def _send_rate_limit_alert(ip: str, faname: str, wait_seconds: int):
+    """Отправляет Telegram-алерт о превышении попыток входа."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    
+    message = (
+        f"⚠️ <b>ПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ</b>\n\n"
+        f"👤 <b>Пользователь:</b> {faname}\n"
+        f"🌐 <b>IP:</b> <code>{ip}</code>\n"
+        f"🔒 <b>Заблокирован на:</b> {wait_seconds // 60} мин\n"
+        f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+        f"<i>Превышен лимит попыток входа "
+        f"({RATE_LIMIT_MAX_ATTEMPTS} за {RATE_LIMIT_WINDOW // 60} мин)</i>"
+    )
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                }
+            )
+            logger.info(f"[Security] 📨 Rate limit алерт отправлен для {faname} @ {ip}")
+    except Exception as e:
+        logger.error(f"[Security] ✗ Ошибка отправки rate limit алерта: {e}")
+
 
 # ============================================================
 #  API SECRET KEY — защита от несанкционированного доступа
@@ -307,13 +372,11 @@ async def security_middleware(request: Request, call_next):
             logger.warning(f"[Security] ⚠ Неверный IP формат: {client_ip}")
         
         if not (is_allowed or is_admin):
-            # IP не в белом списке — блокируем
             logger.warning(
                 f"🚫 [Security] BLOCKED: {client_ip} → {request.method} {path} "
                 f"(IP not in whitelist)"
             )
             
-            # Отправляем алерт в Telegram (с rate limiting)
             if ALERT_ON_BLOCKED_IP:
                 await _send_blocked_ip_alert(client_ip, path, request.method)
             
@@ -345,26 +408,20 @@ async def security_middleware(request: Request, call_next):
 
 
 async def _send_blocked_ip_alert(ip: str, path: str, method: str):
-    """
-    Отправляет алерт в Telegram о попытке доступа с неразрешённого IP.
-    С rate limiting: максимум 1 алерт в 5 минут с одного IP.
-    """
+    """Отправляет алерт в Telegram о попытке доступа с неразрешённого IP."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     
     now = time.time()
-    # Очищаем старые записи (старше 5 минут)
     _blocked_ip_tracker[ip] = [
         t for t in _blocked_ip_tracker[ip] if now - t < 300
     ]
     
-    # Если уже был алерт за последние 5 минут — не шлём
     if _blocked_ip_tracker[ip]:
         return
     
     _blocked_ip_tracker[ip].append(now)
     
-    # Формируем сообщение
     message = (
         f"🚨 <b>ПОПЫТКА ВЗЛОМА!</b>\n\n"
         f"🌐 <b>IP:</b> <code>{ip}</code>\n"
@@ -388,8 +445,8 @@ async def _send_blocked_ip_alert(ip: str, path: str, method: str):
     except Exception as e:
         logger.error(f"[Security] ✗ Ошибка отправки алерта: {e}")
 
-security = HTTPBearer()
 
+security = HTTPBearer()
 _ss_token_cache = {}
 _SS_TOKEN_TTL = 3600  # 1 час
 
@@ -404,12 +461,11 @@ class LoginRequest(BaseModel):
 
 
 class NormalizeSingleRequest(BaseModel):
-    """Схема для нормализации ОДНОГО товара."""
     product_id: int
     product_title: str = Field(default="Неизвестный товар", max_length=500)
     delta: int
     reason: str
-    type: str  # "DISPOSAL" или "ADD"
+    type: str
     session_info: dict
     giver: str
     receiver: str
@@ -417,7 +473,6 @@ class NormalizeSingleRequest(BaseModel):
 
 
 class NormalizeOperation(BaseModel):
-    """Одна операция в пакетном запросе."""
     product_id: int
     product_title: str = Field(default="Неизвестный товар", max_length=500)
     delta: int
@@ -426,7 +481,6 @@ class NormalizeOperation(BaseModel):
 
 
 class NormalizeRequest(BaseModel):
-    """Пакетная нормализация."""
     operations: list[NormalizeOperation]
     session_info: dict
     giver: str
@@ -435,25 +489,7 @@ class NormalizeRequest(BaseModel):
 
 
 class EmployeeSearchRequest(BaseModel):
-    """Схема для поиска сотрудников."""
     query: str = Field(default="", max_length=100)
-
-
-# ============================================================
-#  ❌ ВРЕМЕННО ОТКЛЮЧЕНО: Модели клиентов
-# ============================================================
-# class ClientSearchRequest(BaseModel):
-#     """Схема для поиска клиента по телефону."""
-#     phone: str = Field(..., min_length=10, max_length=15)
-#     point_name: str
-#
-#
-# class DepositUpdateRequest(BaseModel):
-#     """Схема для корректировки депозита."""
-#     client_uuid: str
-#     new_deposit: float = Field(..., ge=0)
-#     reason: str = Field(..., min_length=5, max_length=700)
-#     point_name: str
 
 
 # ============================================================
@@ -490,6 +526,7 @@ def get_db_connection():
 
 def verify_employee(faname: str, password: str) -> bool:
     """Проверяет пароль сотрудника через bcrypt."""
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -500,11 +537,9 @@ def verify_employee(faname: str, password: str) -> bool:
             
             stored_password = row["password"]
             
-            # Проверяем, является ли пароль bcrypt хешем
-            if stored_password.startswith('$2b$') or \
-               stored_password.startswith('$2a$') or \
-               stored_password.startswith('$2y$'):
-                # Новый формат: bcrypt хеш
+            if (stored_password.startswith('$2b$') or 
+                stored_password.startswith('$2a$') or 
+                stored_password.startswith('$2y$')):
                 try:
                     return bcrypt.checkpw(
                         password.encode('utf-8'),
@@ -514,16 +549,22 @@ def verify_employee(faname: str, password: str) -> bool:
                     logger.error(f"bcrypt error for {faname}: {e}")
                     return False
             else:
-                # Старый формат: plaintext (обратная совместимость)
                 logger.warning(f"⚠️ {faname} использует plaintext пароль!")
                 return stored_password == password
     except Exception as e:
         logger.error(f"DB error: {e}")
         return False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
 def log_audit(data: dict):
     """Записывает аудит-лог в БД."""
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -556,6 +597,12 @@ def log_audit(data: dict):
             conn.commit()
     except Exception as e:
         logger.error(f"Audit log error: {e}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
 # ============================================================
@@ -650,7 +697,6 @@ async def fetch_goods_from_ss(warehouse_id: int, search: str = "") -> list:
 
 # ============================================================
 #  🚀 ПАКЕТНОЕ ИЗМЕНЕНИЕ КОЛИЧЕСТВА В SMARTSHELL
-#  Использует множественные GraphQL мутации в одном HTTP-запросе
 # ============================================================
 async def change_quantity_ss(
     warehouse_id: int, 
@@ -658,77 +704,21 @@ async def change_quantity_ss(
     operation: str, 
     chunk_size: int = 25
 ) -> dict:
-    """
-    Изменяет количество товаров в SmartShell ОДНИМ HTTP-запросом
-    с несколькими именованными мутациями внутри.
-    
-    Это позволяет обработать 100+ товаров, потратив только 1 единицу
-    rate limit (1 из 50 в минуту).
-    
-    Принцип работы:
-    1. Разбиваем товары на чанки по chunk_size (по умолчанию 25)
-    2. Строим ОДИН GraphQL запрос с несколькими именованными мутациями:
-       mutation {
-         batch1: changeGoodsQuantity(input: $input1)
-         batch2: changeGoodsQuantity(input: $input2)
-         ...
-       }
-    3. Отправляем ОДИН HTTP-запрос к SmartShell
-    4. Анализируем результат каждой мутации отдельно
-    
-    Args:
-        warehouse_id: ID склада
-        items: список товаров [{"id": int, "quantity": int}, ...]
-        operation: "DISPOSAL" или "ADD"
-        chunk_size: размер чанка (по умолчанию 25)
-    
-    Returns:
-        dict: {
-            "success": bool,           # True если ВСЕ мутации успешны
-            "total_items": int,
-            "successful_items": int,
-            "failed_items": int,
-            "total_batches": int,
-            "successful_batches": int,
-            "failed_batches": int,
-            "errors": list,
-            "ss_request_number": int,  # номер запроса в счётчике
-            "ss_request_count": int,   # всегда 1
-        }
-    """
+    """Изменяет количество товаров в SmartShell ОДНИМ HTTP-запросом."""
     global _smartshell_request_counter
     
-    # ============================================================
-    #  Пустой список — сразу возвращаем успех
-    # ============================================================
     if not items:
         return {
-            "success": True,
-            "total_items": 0,
-            "successful_items": 0,
-            "failed_items": 0,
-            "total_batches": 0,
-            "successful_batches": 0,
-            "failed_batches": 0,
-            "errors": [],
-            "ss_request_number": 0,
-            "ss_request_count": 0,
+            "success": True, "total_items": 0, "successful_items": 0,
+            "failed_items": 0, "total_batches": 0, "successful_batches": 0,
+            "failed_batches": 0, "errors": [],
+            "ss_request_number": 0, "ss_request_count": 0,
         }
     
-    # ============================================================
-    #  Получаем токен SmartShell
-    # ============================================================
     token = await get_smartshell_token(warehouse_id)
-    
-    # ============================================================
-    #  Разбиваем на чанки
-    # ============================================================
     chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
     total_batches = len(chunks)
     
-    # ============================================================
-    #  🎯 СТРОИМ ОДИН GraphQL запрос с несколькими мутациями
-    # ============================================================
     mutation_parts = []
     variables = {}
     variable_declarations = []
@@ -736,65 +726,32 @@ async def change_quantity_ss(
     for idx, chunk in enumerate(chunks, start=1):
         batch_name = f"batch{idx}"
         var_name = f"input{idx}"
-        
-        # Именованная мутация: batch1: changeGoodsQuantity(input: $input1)
-        mutation_parts.append(
-            f"{batch_name}: changeGoodsQuantity(input: ${var_name})"
-        )
-        
-        # Объявление переменной для GraphQL
+        mutation_parts.append(f"{batch_name}: changeGoodsQuantity(input: ${var_name})")
         variable_declarations.append(f"${var_name}: ChangeGoodsQuantityInput!")
-        
-        # Значение переменной
-        variables[var_name] = {
-            "items": chunk,
-            "operation": operation
-        }
+        variables[var_name] = {"items": chunk, "operation": operation}
     
-    # Итоговый GraphQL запрос
     mutation_body = "\n    ".join(mutation_parts)
     vars_declaration = ", ".join(variable_declarations)
     query = f"""mutation ({vars_declaration}) {{
     {mutation_body}
 }}"""
     
-    # ============================================================
-    #  🆕 УВЕЛИЧИВАЕМ СЧЁТЧИК (ДОКАЗАТЕЛЬСТВО ЧТО 1 ЗАПРОС)
-    # ============================================================
     _smartshell_request_counter += 1
     current_request_number = _smartshell_request_counter
     
-    # ============================================================
-    #  📡 ЛОГИРУЕМ ОТПРАВКУ
-    # ============================================================
     logger.info(
         f"📡 [SS-REQUEST #{current_request_number}] "
         f"🚀 {operation}: {len(items)} товаров → "
         f"1 HTTP-запрос с {total_batches} мутациями внутри"
     )
     
-    # Структура чанков
-    chunk_info = ", ".join(
-        f"batch{i}={len(chunks[i-1])}шт" 
-        for i in range(1, total_batches + 1)
-    )
-    logger.info(
-        f"📋 [SS-REQUEST #{current_request_number}] "
-        f"Структура: {chunk_info}"
-    )
-    
-    # Размер запроса (доказательство что всё в одном пакете)
     request_payload = {"query": query, "variables": variables}
     request_size = len(json.dumps(request_payload, ensure_ascii=False))
     logger.info(
         f"📦 [SS-REQUEST #{current_request_number}] "
-        f"Размер HTTP-запроса: {request_size} байт "
-        f"({request_size / 1024:.2f} KB)"
+        f"Размер: {request_size} байт ({request_size / 1024:.2f} KB)"
     )
     
-    # ============================================================
-    #  🚀 ОТПРАВЛЯЕМ ОДИН HTTP-ЗАПРОС К SMARTSHELL
-    # ============================================================
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(
@@ -803,69 +760,39 @@ async def change_quantity_ss(
                 headers={"Authorization": f"Bearer {token}"},
             )
             
-            # ============================================================
-            #  📨 ЛОГИРУЕМ ОДИН HTTP-ОТВЕТ
-            # ============================================================
             logger.info(
                 f"📨 [SS-REQUEST #{current_request_number}] "
-                f"Получен ОДИН HTTP-ответ: HTTP {r.status_code}, "
-                f"размер: {len(r.text)} байт"
+                f"HTTP {r.status_code}, размер: {len(r.text)} байт"
             )
             
-            # ============================================================
-            #  Обработка HTTP ошибок
-            # ============================================================
             if r.status_code != 200:
                 logger.error(
                     f"✗ [SS-REQUEST #{current_request_number}] "
                     f"HTTP error: {r.status_code} — {r.text[:500]}"
                 )
                 return {
-                    "success": False,
-                    "total_items": len(items),
-                    "successful_items": 0,
-                    "failed_items": len(items),
-                    "total_batches": total_batches,
-                    "successful_batches": 0,
+                    "success": False, "total_items": len(items),
+                    "successful_items": 0, "failed_items": len(items),
+                    "total_batches": total_batches, "successful_batches": 0,
                     "failed_batches": total_batches,
-                    "errors": [{
-                        "type": "http_error",
-                        "http_status": r.status_code,
-                        "message": r.text[:500]
-                    }],
-                    "ss_request_number": current_request_number,
-                    "ss_request_count": 1,
+                    "errors": [{"type": "http_error", "http_status": r.status_code,
+                               "message": r.text[:500]}],
+                    "ss_request_number": current_request_number, "ss_request_count": 1,
                 }
             
             data = r.json()
             
-            # ============================================================
-            #  Обработка глобальных GraphQL ошибок (без data)
-            # ============================================================
             if "errors" in data and "data" not in data:
-                logger.error(
-                    f"✗ [SS-REQUEST #{current_request_number}] "
-                    f"GraphQL error (no data): {data['errors']}"
-                )
+                logger.error(f"✗ [SS-REQUEST #{current_request_number}] GraphQL error: {data['errors']}")
                 return {
-                    "success": False,
-                    "total_items": len(items),
-                    "successful_items": 0,
-                    "failed_items": len(items),
-                    "total_batches": total_batches,
-                    "successful_batches": 0,
+                    "success": False, "total_items": len(items),
+                    "successful_items": 0, "failed_items": len(items),
+                    "total_batches": total_batches, "successful_batches": 0,
                     "failed_batches": total_batches,
-                    "errors": [{
-                        "type": "graphql_error",
-                        "errors": data["errors"]
-                    }],
-                    "ss_request_number": current_request_number,
-                    "ss_request_count": 1,
+                    "errors": [{"type": "graphql_error", "errors": data["errors"]}],
+                    "ss_request_number": current_request_number, "ss_request_count": 1,
                 }
             
-            # ============================================================
-            #  📊 АНАЛИЗИРУЕМ РЕЗУЛЬТАТ КАЖДОЙ МУТАЦИИ
-            # ============================================================
             successful_items = 0
             failed_items = 0
             successful_batches = 0
@@ -879,64 +806,48 @@ async def change_quantity_ss(
                 batch_name = f"batch{idx}"
                 chunk_size_actual = len(chunk)
                 
-                # Ищем ошибки именно для этой мутации (по path)
                 batch_errors = [
                     err for err in global_errors
                     if err.get("path") and batch_name in str(err.get("path", []))
                 ]
                 
-                # Результат этой мутации в data
                 batch_result = response_data.get(batch_name)
                 
                 if batch_errors:
-                    # ❌ Мутация упала
                     failed_items += chunk_size_actual
                     failed_batches += 1
                     errors.append({
-                        "batch": idx,
-                        "type": "batch_error",
-                        "errors": batch_errors,
-                        "items_count": chunk_size_actual,
+                        "batch": idx, "type": "batch_error",
+                        "errors": batch_errors, "items_count": chunk_size_actual,
                         "item_ids": [item["id"] for item in chunk]
                     })
                     logger.error(
                         f"✗ [SS-REQUEST #{current_request_number}] "
-                        f"{operation} batch {idx}/{total_batches} FAILED: "
-                        f"{batch_errors}"
+                        f"{operation} batch {idx}/{total_batches} FAILED: {batch_errors}"
                     )
                 elif batch_result is not None:
-                    # ✅ Мутация успешна
                     successful_items += chunk_size_actual
                     successful_batches += 1
                     logger.info(
                         f"✓ [SS-REQUEST #{current_request_number}] "
-                        f"{operation} batch {idx}/{total_batches}: "
-                        f"{chunk_size_actual} items"
+                        f"{operation} batch {idx}/{total_batches}: {chunk_size_actual} items"
                     )
                 else:
-                    # ⚠️ Неоднозначный результат — считаем упавшим
                     failed_items += chunk_size_actual
                     failed_batches += 1
                     errors.append({
-                        "batch": idx,
-                        "type": "unknown_result",
+                        "batch": idx, "type": "unknown_result",
                         "items_count": chunk_size_actual,
                         "item_ids": [item["id"] for item in chunk]
                     })
                     logger.warning(
                         f"⚠ [SS-REQUEST #{current_request_number}] "
-                        f"{operation} batch {idx}/{total_batches}: "
-                        f"ambiguous result"
+                        f"{operation} batch {idx}/{total_batches}: ambiguous result"
                     )
             
-            # ============================================================
-            #  ✅ ИТОГОВЫЙ ЛОГ
-            # ============================================================
             logger.info(
                 f"✅ [SS-REQUEST #{current_request_number}] ЗАВЕРШЁН: "
-                f"{successful_items}/{len(items)} товаров успешно, "
-                f"{successful_batches}/{total_batches} мутаций успешно, "
-                f"использовано 1 из 50 rate limit"
+                f"{successful_items}/{len(items)} товаров успешно"
             )
             
             return {
@@ -949,29 +860,20 @@ async def change_quantity_ss(
                 "failed_batches": failed_batches,
                 "errors": errors,
                 "ss_request_number": current_request_number,
-                "ss_request_count": 1,  # всегда 1 HTTP-запрос
+                "ss_request_count": 1,
             }
     
     except Exception as e:
-        logger.error(
-            f"✗ [SS-REQUEST #{current_request_number}] Exception: {e}"
-        )
+        logger.error(f"✗ [SS-REQUEST #{current_request_number}] Exception: {e}")
         import traceback
         traceback.print_exc()
         return {
-            "success": False,
-            "total_items": len(items),
-            "successful_items": 0,
-            "failed_items": len(items),
-            "total_batches": total_batches,
-            "successful_batches": 0,
+            "success": False, "total_items": len(items),
+            "successful_items": 0, "failed_items": len(items),
+            "total_batches": total_batches, "successful_batches": 0,
             "failed_batches": total_batches,
-            "errors": [{
-                "type": "exception",
-                "exception": str(e)
-            }],
-            "ss_request_number": current_request_number,
-            "ss_request_count": 1,
+            "errors": [{"type": "exception", "exception": str(e)}],
+            "ss_request_number": current_request_number, "ss_request_count": 1,
         }
 
 
@@ -980,7 +882,7 @@ async def change_quantity_ss(
 # ============================================================
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "QFact API", "version": "1.3.0"}
+    return {"status": "ok", "service": "QFact API", "version": "1.6.0"}
 
 
 # ------------------------------------------------------------
@@ -988,19 +890,39 @@ async def root():
 # ------------------------------------------------------------
 @app.post("/api/auth/login")
 async def login(req: LoginRequest, request: Request):
+    # Определяем реальный IP
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    
     if req.point_name not in WAREHOUSE_IDS:
         raise HTTPException(400, f"Неизвестная точка: {req.point_name}")
 
+    # 🆕 RATE LIMIT CHECK
+    is_allowed, wait_seconds = _check_rate_limit(client_ip, req.faname)
+    if not is_allowed:
+        logger.warning(f"[Security] 🚫 Rate limit: {req.faname} @ {client_ip}")
+        await _send_rate_limit_alert(client_ip, req.faname, wait_seconds)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Слишком много попыток. Подождите {wait_seconds // 60} мин",
+            headers={"Retry-After": str(wait_seconds)}
+        )
+
     if not verify_employee(req.faname, req.password):
+        _register_failed_attempt(client_ip, req.faname)
         log_audit({
             "faname": req.faname,
             "point_name": req.point_name,
             "operation_type": "LOGIN_FAILED",
-            "ip": request.client.host,
+            "ip": client_ip,
             "user_agent": request.headers.get("user-agent", ""),
         })
         raise HTTPException(401, "Неверный логин или пароль")
 
+    _reset_attempts(client_ip, req.faname)
+    
     warehouse_id = WAREHOUSE_IDS[req.point_name]
     token = create_jwt_token(req.faname, req.point_name, warehouse_id)
 
@@ -1009,27 +931,44 @@ async def login(req: LoginRequest, request: Request):
         "point_name": req.point_name,
         "warehouse_id": warehouse_id,
         "operation_type": "LOGIN_SUCCESS",
-        "ip": request.client.host,
+        "ip": client_ip,
         "user_agent": request.headers.get("user-agent", ""),
     })
 
-    logger.info(f"✓ Login: {req.faname} @ {req.point_name} from {request.client.host}")
+    logger.info(f"✓ Login: {req.faname} @ {req.point_name} from {client_ip}")
     return {"access_token": token, "warehouse_id": warehouse_id}
 
 
 @app.post("/api/auth/verify_password")
 async def verify_password(request: Request):
-    """
-    Проверяет пароль конкретного сотрудника БЕЗ выдачи JWT.
-    Поддерживает как bcrypt-хеши (новый формат), так и plaintext (обратная совместимость).
-    """
+    """Проверяет пароль БЕЗ выдачи JWT (с rate limiting)."""
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    
     try:
         data = await request.json()
         faname = data.get("faname", "").strip()
-        password = data.get("password", "")  # без .strip() чтобы пробелы в пароле учитывались
+        password = data.get("password", "")
         
         if not faname or not password:
             return {"verified": False, "error": "Не указан ФИО или пароль"}
+        
+        # 🆕 RATE LIMIT CHECK
+        is_allowed, wait_seconds = _check_rate_limit(client_ip, faname)
+        if not is_allowed:
+            logger.warning(f"[Security] 🚫 Rate limit: {faname} @ {client_ip}")
+            await _send_rate_limit_alert(client_ip, faname, wait_seconds)
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "verified": False,
+                    "error": f"Слишком много попыток. Подождите {wait_seconds // 60} мин",
+                    "retry_after": wait_seconds,
+                },
+                headers={"Retry-After": str(wait_seconds)}
+            )
         
         def db_query():
             conn = get_db_connection()
@@ -1050,50 +989,39 @@ async def verify_password(request: Request):
         row = await loop.run_in_executor(None, db_query)
         
         if not row:
-            logger.warning(f"[Auth] ✗ Сотрудник не найден: {faname}")
-            return {"verified": False, "error": "Сотрудник не найден"}
+            _register_failed_attempt(client_ip, faname)
+            return {"verified": False, "error": "Неверный пароль"}
         
-        db_faname = row["faname"]
         db_password = row["password"]
-        
-        # === 🆕 Проверка пароля с поддержкой bcrypt ===
         is_valid = False
         
-        # Определяем формат пароля
         if (db_password.startswith('$2b$') or 
             db_password.startswith('$2a$') or 
             db_password.startswith('$2y$')):
-            # Новый формат: bcrypt хеш
             try:
                 is_valid = bcrypt.checkpw(
                     password.encode('utf-8'),
                     db_password.encode('utf-8')
                 )
-                if is_valid:
-                    logger.info(f"[Auth] ✓ Пароль верен (bcrypt): {faname}")
-                else:
-                    logger.warning(f"[Auth] ✗ Неверный пароль (bcrypt): {faname}")
             except Exception as e:
-                logger.error(f"[Auth] bcrypt error для {faname}: {e}")
+                logger.error(f"[Auth] bcrypt error: {e}")
                 is_valid = False
         else:
-            # Старый формат: plaintext (обратная совместимость)
             is_valid = db_password == password
-            if is_valid:
-                logger.warning(f"[Auth] ⚠ {faname} использует plaintext пароль! Запустите migrate_passwords.py")
-            else:
-                logger.warning(f"[Auth] ✗ Неверный пароль (plaintext): {faname}")
         
         if is_valid:
-            return {"verified": True, "faname": db_faname}
+            _reset_attempts(client_ip, faname)
+            logger.info(f"[Auth] ✓ Пароль верен: {faname} @ {client_ip}")
+            return {"verified": True, "faname": row["faname"]}
         else:
+            _register_failed_attempt(client_ip, faname)
+            logger.warning(f"[Auth] ✗ Неверный пароль: {faname} @ {client_ip}")
             return {"verified": False, "error": "Неверный пароль"}
     
     except Exception as e:
-        logger.error(f"[Auth] ✗ Ошибка verify_password: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"[Auth] ✗ Ошибка: {e}")
         return {"verified": False, "error": str(e)}
+
 
 # ------------------------------------------------------------
 #  Список товаров
@@ -1108,12 +1036,7 @@ async def get_goods(
 
 
 # ------------------------------------------------------------
-#  🚀 ПАКЕТНАЯ НОРМАЛИЗАЦИЯ (основной endpoint)
-#  Все товары в одном запросе, VPS автоматически:
-#  1. Разделяет на DISPOSAL и ADD
-#  2. Разбивает на батчи по 25
-#  3. Формирует множественные GraphQL мутации
-#  4. Делает 1 HTTP-запрос к SmartShell на каждый тип операции
+#  🚀 ПАКЕТНАЯ НОРМАЛИЗАЦИЯ
 # ------------------------------------------------------------
 @app.post("/api/normalize")
 async def normalize(
@@ -1124,7 +1047,6 @@ async def normalize(
     if not req.operations:
         raise HTTPException(400, "Нет операций")
 
-    # Валидация причин (разрешаем пустую строку — причина заполняется позже в TroubleDialog)
     for op in req.operations:
         if op.type == "DISPOSAL":
             if op.reason and op.reason not in ALLOWED_REASONS_LESS:
@@ -1141,7 +1063,6 @@ async def normalize(
         f"{len(req.operations)} всего"
     )
 
-    # Audit log — одна запись на весь пакет
     details_list = []
     for op in req.operations:
         details_list.append({
@@ -1166,29 +1087,20 @@ async def normalize(
     })
 
     result = {
-        "success": 0,
-        "failed": 0,
-        "errors": [],
-        "operations": [],
-        "chunks_info": {
-            "disposal": None,
-            "add": None
-        }
+        "success": 0, "failed": 0, "errors": [], "operations": [],
+        "chunks_info": {"disposal": None, "add": None}
     }
 
-    # === DISPOSAL (один HTTP-запрос к SmartShell) ===
     if disposals:
         items = [{"id": op.product_id, "quantity": abs(op.delta)} for op in disposals]
         
         logger.info(
-            f"🚀 DISPOSAL: {len(disposals)} товаров в одном запросе → "
+            f"🚀 DISPOSAL: {len(disposals)} товаров → "
             f"{(len(disposals) + 24) // 25} батчей"
         )
         
         disposal_result = await change_quantity_ss(
-            user["warehouse_id"],
-            items,
-            "DISPOSAL"
+            user["warehouse_id"], items, "DISPOSAL"
         )
         
         result["chunks_info"]["disposal"] = disposal_result
@@ -1210,23 +1122,20 @@ async def normalize(
             })
             if success:
                 logger.info(
-                    f"✓ DISPOSAL {op.product_title} (id={op.product_id}, qty={abs(op.delta)}) "
+                    f"✓ DISPOSAL {op.product_title} (id={op.product_id}) "
                     f"by {user['faname']} @ {req.point_name}"
                 )
 
-    # === ADD (один HTTP-запрос к SmartShell) ===
     if additions:
         items = [{"id": op.product_id, "quantity": abs(op.delta)} for op in additions]
         
         logger.info(
-            f"🚀 ADD: {len(additions)} товаров в одном запросе → "
+            f"🚀 ADD: {len(additions)} товаров → "
             f"{(len(additions) + 24) // 25} батчей"
         )
         
         add_result = await change_quantity_ss(
-            user["warehouse_id"],
-            items,
-            "ADD"
+            user["warehouse_id"], items, "ADD"
         )
         
         result["chunks_info"]["add"] = add_result
@@ -1248,7 +1157,7 @@ async def normalize(
             })
             if success:
                 logger.info(
-                    f"✓ ADD {op.product_title} (id={op.product_id}, qty={abs(op.delta)}) "
+                    f"✓ ADD {op.product_title} (id={op.product_id}) "
                     f"by {user['faname']} @ {req.point_name}"
                 )
 
@@ -1262,7 +1171,7 @@ async def normalize(
 
 
 # ------------------------------------------------------------
-#  Нормализация ОДНОГО товара (legacy endpoint)
+#  Нормализация ОДНОГО товара (legacy)
 # ------------------------------------------------------------
 @app.post("/api/normalize/single")
 async def normalize_single(
@@ -1270,19 +1179,18 @@ async def normalize_single(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    """Нормализация ОДНОГО товара через серверный прокси."""
     if req.type == "DISPOSAL":
         if req.reason not in ALLOWED_REASONS_LESS:
-            raise HTTPException(400, f"Недопустимая причина списания: {req.reason}")
+            raise HTTPException(400, f"Недопустимая причина: {req.reason}")
         if req.delta >= 0:
-            raise HTTPException(400, f"Для DISPOSAL delta должен быть < 0: {req.delta}")
+            raise HTTPException(400, f"Для DISPOSAL delta < 0: {req.delta}")
     elif req.type == "ADD":
         if req.reason not in ALLOWED_REASONS_MORE:
-            raise HTTPException(400, f"Недопустимая причина внесения: {req.reason}")
+            raise HTTPException(400, f"Недопустимая причина: {req.reason}")
         if req.delta <= 0:
-            raise HTTPException(400, f"Для ADD delta должен быть > 0: {req.delta}")
+            raise HTTPException(400, f"Для ADD delta > 0: {req.delta}")
     else:
-        raise HTTPException(400, f"Неизвестный тип операции: {req.type}")
+        raise HTTPException(400, f"Неизвестный тип: {req.type}")
 
     quantity = abs(req.delta)
     product_title = req.product_title
@@ -1313,8 +1221,8 @@ async def normalize_single(
     
     if ss_result["success"]:
         logger.info(
-            f"✓ {req.type} {product_title} (id={req.product_id}, qty={quantity}) "
-            f"by {user['faname']} @ {req.point_name} — reason: {req.reason}"
+            f"✓ {req.type} {product_title} (id={req.product_id}) "
+            f"by {user['faname']} @ {req.point_name}"
         )
         return {
             "success": True,
@@ -1329,25 +1237,20 @@ async def normalize_single(
     else:
         error_details = ss_result["errors"][0] if ss_result["errors"] else {}
         logger.error(
-            f"✗ Failed {req.type} {product_title} (id={req.product_id}) "
-            f"by {user['faname']} @ {req.point_name}: {error_details}"
+            f"✗ Failed {req.type} {product_title} (id={req.product_id}): {error_details}"
         )
         return {
             "success": False,
-            "error": f"SmartShell operation failed: {error_details.get('type', 'unknown')}"
+            "error": f"SmartShell failed: {error_details.get('type', 'unknown')}"
         }
 
 
 # ------------------------------------------------------------
-#  Поиск сотрудников (публичный, без JWT)
+#  Поиск сотрудников
 # ------------------------------------------------------------
 @app.post("/api/employees/search")
 async def search_employees(req: EmployeeSearchRequest):
-    """
-    Публичный поиск сотрудников по ФИО (для автодополнения).
-    Возвращает только ФИО — без паролей и другой чувствительной информации.
-    Не требует JWT-токена.
-    """
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1364,52 +1267,35 @@ async def search_employees(req: EmployeeSearchRequest):
     except Exception as e:
         logger.error(f"Employee search error: {e}")
         return {"employees": []}
-
-
-# ============================================================
-#  ❌ ВРЕМЕННО ОТКЛЮЧЕНО: Поиск клиентов по телефону
-# ============================================================
-# @app.post("/api/clients/search")
-# async def search_client(req: ClientSearchRequest, request: Request):
-#     """Поиск клиента по номеру телефона в SmartShell."""
-#     ... (код сохранён в твоём текущем main.py)
-
-
-# ============================================================
-#  ❌ ВРЕМЕННО ОТКЛЮЧЕНО: Корректировка депозита
-# ============================================================
-# class DepositUpdatePublicRequest(BaseModel):
-#     ...
-#
-# @app.post("/api/clients/deposit")
-# async def update_deposit(req: DepositUpdatePublicRequest, request: Request):
-#     ... (код сохранён в твоём текущем main.py)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
 # ============================================================
 #  🆕 МОДЕЛИ ДЛЯ СОХРАНЕНИЯ ИТОГОВ ПЕРЕСЧЁТА
 # ============================================================
 class InventoryOperationItem(BaseModel):
-    """Одна операция нормализации."""
     product_id: int
     product_title: str = Field(..., max_length=500)
     quantity: int = Field(..., ge=0)
     cost: float = 0.0
-    operation_type: str  # "DISPOSAL" или "ADD"
+    operation_type: str
     reason: str = ""
 
 
 class SaveInventoryOperationsRequest(BaseModel):
-    """Пакетное сохранение операций инвентаризации."""
     operations: list[InventoryOperationItem]
     point_name: str
     administrator: str = Field(..., max_length=255)
     session_label: str = Field(..., max_length=255)
-    operation_date: str  # ISO format
+    operation_date: str
 
 
 class SaveSessionDispolRequest(BaseModel):
-    """Сохранение итога смены с чистым минусом."""
     point_name: str
     administrator: str = Field(..., max_length=255)
     cost: float = Field(..., ge=0)
@@ -1420,7 +1306,7 @@ class SaveSessionDispolRequest(BaseModel):
 
 
 # ============================================================
-#  🆕 ИНВЕНТАРИЗАЦИЯ: Сохранение операций нормализации
+#  🆕 ИНВЕНТАРИЗАЦИЯ: Сохранение операций
 # ============================================================
 @app.post("/api/inventory/save-operations")
 async def save_inventory_operations(
@@ -1428,10 +1314,10 @@ async def save_inventory_operations(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    """Сохраняет batch операций нормализации в таблицу inventory_operation."""
     if not req.operations:
         return {"success": True, "inserted": 0, "message": "Нет операций"}
     
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1452,16 +1338,9 @@ async def save_inventory_operations(
                         product_title, quantity, cost, operation_type, reason, session_label)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
-                        operation_date,
-                        req.point_name,
-                        req.administrator,
-                        op.product_id,
-                        op.product_title,
-                        op.quantity,
-                        op.cost,
-                        op.operation_type,
-                        op.reason,
-                        req.session_label,
+                        operation_date, req.point_name, req.administrator,
+                        op.product_id, op.product_title, op.quantity, op.cost,
+                        op.operation_type, op.reason, req.session_label,
                     ),
                 )
                 inserted += 1
@@ -1485,7 +1364,7 @@ async def save_inventory_operations(
         
         logger.info(
             f"✓ Saved {inserted} inventory operations for "
-            f"{req.administrator} @ {req.point_name} ({req.session_label})"
+            f"{req.administrator} @ {req.point_name}"
         )
         
         return {
@@ -1499,10 +1378,16 @@ async def save_inventory_operations(
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
 # ============================================================
-#  🆕 ИНВЕНТАРИЗАЦИЯ: Сохранение итога смены (чистый минус)
+#  🆕 ИНВЕНТАРИЗАЦИЯ: Сохранение итога смены
 # ============================================================
 @app.post("/api/inventory/save-session-dispol")
 async def save_session_dispol(
@@ -1510,7 +1395,7 @@ async def save_session_dispol(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    """Сохраняет итог смены в таблицу session_dispol."""
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1522,17 +1407,11 @@ async def save_session_dispol(
                    (point_name, administrator, cost, allItem, allitemDis, reason, session_label)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (
-                    req.point_name,
-                    req.administrator,
-                    req.cost,
-                    all_item_json,
-                    all_item_dis_json,
-                    req.reason,
-                    req.session_label,
+                    req.point_name, req.administrator, req.cost,
+                    all_item_json, all_item_dis_json, req.reason, req.session_label,
                 ),
             )
             conn.commit()
-            
             new_id = cur.lastrowid
         
         log_audit({
@@ -1547,14 +1426,12 @@ async def save_session_dispol(
                 "administrator": req.administrator,
                 "session_label": req.session_label,
                 "cost": req.cost,
-                "all_items_count": len(req.allItem),
-                "dis_items_count": len(req.allitemDis),
             },
         })
         
         logger.info(
-            f"✓ Saved session_dispol (id={new_id}) for {req.administrator} @ {req.point_name}: "
-            f"cost={req.cost:.2f}, items={len(req.allitemDis)} ({req.session_label})"
+            f"✓ Saved session_dispol (id={new_id}) for {req.administrator}: "
+            f"cost={req.cost:.2f} ({req.session_label})"
         )
         
         return {
@@ -1568,34 +1445,37 @@ async def save_session_dispol(
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 
 # ============================================================
-#  🆕 МОДЕЛИ ДЛЯ TROUBLE (причины недостач/избытков)
+#  🆕 МОДЕЛИ ДЛЯ TROUBLE
 # ============================================================
 class TroubleOperationItem(BaseModel):
-    """Одна операция с причиной и ссылкой."""
     product_id: int
     product_title: str = Field(..., max_length=500)
     quantity: int = Field(..., ge=0)
     cost: float = 0.0
-    operation_type: str  # "DISPOSAL" или "ADD"
+    operation_type: str
     reason: str = Field(..., max_length=500)
     reference: str = Field(default="", max_length=2000)
-    is_excusable: bool = False  # уважительная причина + reference
+    is_excusable: bool = False
 
 
 class SaveTroubleOperationsRequest(BaseModel):
-    """Пакетное сохранение trouble-операций."""
     operations: list[TroubleOperationItem]
     point_name: str
     administrator: str = Field(..., max_length=255)
     session_label: str = Field(..., max_length=255)
-    operation_date: str  # ISO format
+    operation_date: str
 
 
 class SaveCorrectTroubleRequest(BaseModel):
-    """Сохранение итога смены с учётом помилований."""
     point_name: str
     administrator: str = Field(..., max_length=255)
     cost: float = Field(..., ge=0)
@@ -1606,8 +1486,9 @@ class SaveCorrectTroubleRequest(BaseModel):
     allRef: list = []
     session_label: str = Field(..., max_length=255)
 
+
 # ============================================================
-#  🆕 TROUBLE: Сохранение операций с причинами
+#  🆕 TROUBLE: Сохранение операций
 # ============================================================
 @app.post("/api/inventory/save-trouble-operations")
 async def save_trouble_operations(
@@ -1615,10 +1496,10 @@ async def save_trouble_operations(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    """Сохраняет операции с причинами и ссылками в inventory_operation_trouble."""
     if not req.operations:
         return {"success": True, "inserted": 0, "message": "Нет операций"}
     
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1640,18 +1521,10 @@ async def save_trouble_operations(
                         reference, is_excusable, session_label)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
-                        operation_date,
-                        req.point_name,
-                        req.administrator,
-                        op.product_id,
-                        op.product_title,
-                        op.quantity,
-                        op.cost,
-                        op.operation_type,
-                        op.reason,
-                        op.reference or None,
-                        1 if op.is_excusable else 0,
-                        req.session_label,
+                        operation_date, req.point_name, req.administrator,
+                        op.product_id, op.product_title, op.quantity, op.cost,
+                        op.operation_type, op.reason, op.reference or None,
+                        1 if op.is_excusable else 0, req.session_label,
                     ),
                 )
                 inserted += 1
@@ -1675,7 +1548,7 @@ async def save_trouble_operations(
         
         logger.info(
             f"✓ Saved {inserted} trouble operations for "
-            f"{req.administrator} @ {req.point_name} ({req.session_label})"
+            f"{req.administrator} @ {req.point_name}"
         )
         
         return {"success": True, "inserted": inserted}
@@ -1685,9 +1558,16 @@ async def save_trouble_operations(
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
 
 # ============================================================
-#  🆕 TROUBLE: Сохранение итога с учётом помилований
+#  🆕 TROUBLE: Сохранение итога с помилованиями
 # ============================================================
 @app.post("/api/inventory/save-correct-trouble")
 async def save_correct_trouble(
@@ -1695,7 +1575,7 @@ async def save_correct_trouble(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    """Сохраняет итог смены с учётом уважительных причин."""
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1705,13 +1585,10 @@ async def save_correct_trouble(
                     costTrouble, costDisTrouble, allRef, session_label)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
-                    req.point_name,
-                    req.administrator,
-                    req.cost,
+                    req.point_name, req.administrator, req.cost,
                     json.dumps(req.allitemTrouble, ensure_ascii=False, default=str),
                     json.dumps(req.allitemDis, ensure_ascii=False, default=str),
-                    req.costTrouble,
-                    req.costDisTrouble,
+                    req.costTrouble, req.costDisTrouble,
                     json.dumps(req.allRef, ensure_ascii=False, default=str),
                     req.session_label,
                 ),
@@ -1737,9 +1614,8 @@ async def save_correct_trouble(
         })
         
         logger.info(
-            f"✓ Saved correctTrouble (id={new_id}) for {req.administrator} @ {req.point_name}: "
-            f"cost={req.cost:.2f}, costTrouble={req.costTrouble:.2f}, "
-            f"costDisTrouble={req.costDisTrouble:.2f} ({req.session_label})"
+            f"✓ Saved correctTrouble (id={new_id}) for {req.administrator}: "
+            f"costTrouble={req.costTrouble:.2f}, costDisTrouble={req.costDisTrouble:.2f}"
         )
         
         return {
@@ -1753,12 +1629,18 @@ async def save_correct_trouble(
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
 
 # ============================================================
-# 🆕 v1.4.0: МОДЕЛИ ДЛЯ refState (товары на проверке со ссылками)
+# 🆕 v1.4.0: МОДЕЛИ ДЛЯ refState
 # ============================================================
 class RefStateGeneralRequest(BaseModel):
-    """Общий отчёт о товарах на ручной проверке."""
     point_name: str
     administrator: str = Field(..., max_length=255)
     session_label: str = Field(default="", max_length=255)
@@ -1771,7 +1653,6 @@ class RefStateGeneralRequest(BaseModel):
 
 
 class RefStateDetailedItem(BaseModel):
-    """Одна запись детализации (товар + ссылка)."""
     administrator: str = Field(..., max_length=255)
     product_title: str = Field(..., max_length=500)
     product_id: int = None
@@ -1782,26 +1663,25 @@ class RefStateDetailedItem(BaseModel):
 
 
 class RefStateDetailedRequest(BaseModel):
-    """Пакет детализации для одного отчёта."""
     general_id: int
     items: list[RefStateDetailedItem]
 
 
 class TelegramRefStateRequest(BaseModel):
-    """Запрос на отправку refState-отчёта в Telegram."""
     point_name: str
     message: str
     parse_mode: str = "HTML"
 
+
 # ============================================================
-# 🆕 v1.5.0: refState — сохранение отчётов о товарах на проверке
+# 🆕 v1.5.0: refState — сохранение отчётов
 # ============================================================
 @app.post("/api/ref-state/general")
 async def save_ref_state_general(
     req: RefStateGeneralRequest,
     request: Request,
 ):
-    """Сохраняет общий отчёт в refStateGeneral (без JWT, только X-API-Key)."""
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1811,21 +1691,14 @@ async def save_ref_state_general(
                     total_items, total_value, items_on_check, links_count, pdf_path)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
-                    req.point_name,
-                    req.administrator,
-                    req.session_label,
-                    req.total_types,
-                    req.total_items,
-                    req.total_value,
-                    req.items_on_check,
-                    req.links_count,
-                    req.pdf_path,
+                    req.point_name, req.administrator, req.session_label,
+                    req.total_types, req.total_items, req.total_value,
+                    req.items_on_check, req.links_count, req.pdf_path,
                 ),
             )
             conn.commit()
             new_id = cur.lastrowid
         
-        # 🆕 Упрощённый аудит без user (т.к. нет JWT)
         log_audit({
             "faname": req.administrator,
             "point_name": req.point_name,
@@ -1846,7 +1719,7 @@ async def save_ref_state_general(
         
         logger.info(
             f"✓ Saved refStateGeneral (id={new_id}) for {req.administrator} @ {req.point_name}: "
-            f"{req.items_on_check} товаров, {req.links_count} ссылок ({req.session_label})"
+            f"{req.items_on_check} товаров, {req.links_count} ссылок"
         )
         return {"success": True, "id": new_id}
     except Exception as e:
@@ -1854,16 +1727,23 @@ async def save_ref_state_general(
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
 
 @app.post("/api/ref-state/detailed")
 async def save_ref_state_detailed(
     req: RefStateDetailedRequest,
     request: Request,
 ):
-    """Сохраняет детализацию (без JWT, только X-API-Key)."""
     if not req.items:
         return {"success": True, "inserted": 0, "message": "Нет записей"}
     
+    conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -1875,20 +1755,14 @@ async def save_ref_state_detailed(
                         reference, quantity, value, reason)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
-                        req.general_id,
-                        item.administrator,
-                        item.product_title,
-                        item.product_id,
-                        item.reference,
-                        item.quantity,
-                        item.value,
-                        item.reason,
+                        req.general_id, item.administrator, item.product_title,
+                        item.product_id, item.reference, item.quantity,
+                        item.value, item.reason,
                     ),
                 )
                 inserted += 1
             conn.commit()
         
-        # Администратора берём из первой записи
         admin_name = req.items[0].administrator if req.items else "system"
         
         log_audit({
@@ -1914,9 +1788,16 @@ async def save_ref_state_detailed(
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
 
 # ============================================================
-# 🆕 v1.5.0: Telegram — отправка refState-отчётов по топикам
+# 🆕 v1.5.0: Telegram — отправка PDF-отчёта в топик
 # ============================================================
 @app.post("/api/telegram/send-ref-state-with-pdf")
 async def send_ref_state_with_pdf(
@@ -1926,9 +1807,7 @@ async def send_ref_state_with_pdf(
     parse_mode: str = Form("HTML"),
     pdf_file: UploadFile = File(...),
 ):
-    """
-    Отправляет PDF-отчёт в Telegram топик (без JWT, только X-API-Key).
-    """
+    """Отправляет PDF-отчёт в Telegram топик (без JWT, только X-API-Key)."""
     topic_id = TELEGRAM_TOPIC_MAP.get(point_name)
     if not topic_id or topic_id <= 0:
         return {"success": False, "error": f"no valid topic_id for '{point_name}'"}
@@ -1949,7 +1828,6 @@ async def send_ref_state_with_pdf(
         logger.warning(f"[Telegram] ⚠ Caption обрезан с {len(message)} до 1024 символов")
     
     try:
-        import io
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
         
         files = {
@@ -1995,101 +1873,6 @@ async def send_ref_state_with_pdf(
         traceback.print_exc()
         return {"success": False, "error": str(e)}
 
-# ============================================================
-# 🆕 v1.5.0: Telegram — отправка PDF с caption (подписью)
-# ============================================================
-from fastapi import UploadFile, File, Form
-
-@app.post("/api/telegram/send-ref-state-with-pdf")
-async def send_ref_state_with_pdf(
-    request: Request,
-    user: dict = Depends(get_current_user),
-    point_name: str = Form(...),
-    message: str = Form(...),
-    parse_mode: str = Form("HTML"),
-    pdf_file: UploadFile = File(...),
-):
-    """
-    Отправляет PDF-отчёт в Telegram топик конкретной точки
-    с текстом отчёта в качестве подписи (caption).
-    """
-    # Проверка topic_id
-    topic_id = TELEGRAM_TOPIC_MAP.get(point_name)
-    if not topic_id or topic_id <= 0:
-        return {
-            "success": False,
-            "error": f"no valid topic_id for '{point_name}'"
-        }
-    
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"success": False, "error": "bot/chat_id not configured"}
-    
-    # Проверка размера файла (Telegram limit = 50MB)
-    content = await pdf_file.read()
-    file_size = len(content)
-    if file_size > 50 * 1024 * 1024:
-        return {"success": False, "error": "file too large (>50MB)"}
-    
-    # Проверка длины caption (Telegram limit = 1024 chars)
-    caption = message
-    caption_truncated = False
-    if len(caption) > 1024:
-        caption = caption[:1020] + "..."
-        caption_truncated = True
-        logger.warning(
-            f"[Telegram] ⚠ Caption обрезан с {len(message)} до 1024 символов"
-        )
-    
-    try:
-        import io
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        
-        # multipart/form-data для Telegram
-        files = {
-            "document": (
-                pdf_file.filename or "report.pdf",
-                io.BytesIO(content),
-                "application/pdf"
-            )
-        }
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "message_thread_id": topic_id,
-            "caption": caption,
-            "parse_mode": parse_mode,
-        }
-        
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(url, data=data, files=files)
-            
-            if r.status_code == 200:
-                result_data = r.json()
-                message_id = result_data.get("result", {}).get("message_id")
-                logger.info(
-                    f"[Telegram] ✓ PDF отправлен в топик '{point_name}' "
-                    f"(topic_id={topic_id}, message_id={message_id}, "
-                    f"size={file_size} bytes)"
-                )
-                return {
-                    "success": True,
-                    "message_id": message_id,
-                    "file_size": file_size,
-                    "caption_truncated": caption_truncated,
-                }
-            else:
-                logger.error(
-                    f"[Telegram] ✗ HTTP {r.status_code}: {r.text[:500]}"
-                )
-                return {"success": False, "error": f"HTTP {r.status_code}"}
-    
-    except httpx.TimeoutException:
-        logger.error(f"[Telegram] ✗ Timeout при отправке PDF в {point_name}")
-        return {"success": False, "error": "timeout"}
-    except Exception as e:
-        logger.error(f"[Telegram] ✗ Ошибка отправки PDF: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "error": str(e)}
 
 # ============================================================
 #  ЗАПУСК
