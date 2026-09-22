@@ -81,11 +81,24 @@ WAREHOUSE_IDS = {
 # ============================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_TOPIC_ID = os.getenv("TELEGRAM_TOPIC_ID", "")
+
+# 🆕 v1.4.0: Mapping точка → topic_id для рассылки отчётов по филиалам
+# Базовые значения в коде, можно переопределить через .env
+TELEGRAM_TOPIC_MAP = {
+    "Русская": int(os.getenv("TELEGRAM_TOPIC_RUSSKAYA", "4")),
+    "Сахалинская": int(os.getenv("TELEGRAM_TOPIC_SAHALINSKAYA", "9")),
+    "Трамвайная": int(os.getenv("TELEGRAM_TOPIC_TRAMVAYNAYA", "7")),
+    "Светланская": int(os.getenv("TELEGRAM_TOPIC_SVETLAYA", "11213")),
+    "Ульяновская": int(os.getenv("TELEGRAM_TOPIC_ULYANOVSKAYA", "10")),
+    "Калинина": int(os.getenv("TELEGRAM_TOPIC_KALININA", "118019")),
+}
 
 
 async def send_telegram_alert(message: str):
-    """Отправляет сообщение в Telegram супергруппу (в конкретный топик)."""
+    """
+    Отправляет критические уведомления (crash-логи) в общий чат супергруппы.
+    Используется для алертов которые должны видеть ВСЕ филиалы.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("[Telegram] ⚠ Не настроен бот или chat_id — пропуск")
         return
@@ -99,9 +112,8 @@ async def send_telegram_alert(message: str):
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        
-        if TELEGRAM_TOPIC_ID:
-            payload["message_thread_id"] = int(TELEGRAM_TOPIC_ID)
+        # 🆕 v1.4.0: Убрали TELEGRAM_TOPIC_ID — теперь алерты идут в основной чат супергруппы
+        # (без message_thread_id — сообщение попадает в general чат, а не в конкретный топик)
         
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(url, json=payload)
@@ -114,6 +126,92 @@ async def send_telegram_alert(message: str):
     except Exception as e:
         logger.error(f"[Telegram] ✗ Ошибка отправки: {e}")
 
+
+async def send_telegram_to_topic(point_name: str, message: str, parse_mode: str = "HTML") -> dict:
+    """
+    🆕 v1.4.0: Отправляет сообщение в конкретный топик супергруппы
+    в зависимости от точки (филиала).
+    
+    Используется для отчётов refState — каждый филиал получает
+    только свои товары на проверке в свой топик.
+    
+    Args:
+        point_name: Название точки ("Русская", "Сахалинская" и т.д.)
+        message: Текст сообщения (поддерживает HTML если parse_mode="HTML")
+        parse_mode: "HTML" или "Markdown"
+    
+    Returns:
+        {"success": bool, "message_id": int|None, "error": str|None}
+    """
+    # Проверка базовой конфигурации
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("[Telegram] ⚠ Не настроен бот или chat_id — пропуск")
+        return {"success": False, "error": "bot/chat_id not configured"}
+    
+    # Получаем topic_id для точки
+    topic_id = TELEGRAM_TOPIC_MAP.get(point_name)
+    
+    # 🆕 Валидация: topic_id должен быть положительным числом
+    # (0 или None = топик не настроен)
+    if not topic_id or topic_id <= 0:
+        logger.warning(
+            f"[Telegram] ⚠ Нет валидного topic_id для точки '{point_name}' "
+            f"(получено: {topic_id}). Доступные: {list(TELEGRAM_TOPIC_MAP.keys())}"
+        )
+        return {
+            "success": False, 
+            "error": f"no valid topic_id for '{point_name}'"
+        }
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_thread_id": topic_id,
+            "text": message,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=payload)
+            
+            if r.status_code == 200:
+                data = r.json()
+                message_id = data.get("result", {}).get("message_id")
+                logger.info(
+                    f"[Telegram] ✓ Отчёт отправлен в топик '{point_name}' "
+                    f"(topic_id={topic_id}, message_id={message_id})"
+                )
+                return {"success": True, "message_id": message_id, "error": None}
+            
+            # Telegram вернул ошибку — разбираем причину
+            error_text = r.text[:300]
+            logger.error(
+                f"[Telegram] ✗ HTTP {r.status_code} для точки '{point_name}' "
+                f"(topic_id={topic_id}): {error_text}"
+            )
+            
+            # Специфичные ошибки Telegram
+            if r.status_code == 400 and "message_thread_id" in error_text.lower():
+                return {
+                    "success": False,
+                    "error": f"Invalid topic_id {topic_id} for point '{point_name}'"
+                }
+            if r.status_code == 401:
+                return {"success": False, "error": "Invalid bot token"}
+            
+            return {"success": False, "error": f"HTTP {r.status_code}"}
+    
+    except httpx.TimeoutException:
+        logger.error(f"[Telegram] ✗ Таймаут отправки в топик {point_name}")
+        return {"success": False, "error": "timeout"}
+    
+    except Exception as e:
+        logger.error(f"[Telegram] ✗ Ошибка отправки в топик '{point_name}': {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
 # ============================================================
 #  FASTAPI APP
