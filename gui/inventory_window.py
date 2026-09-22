@@ -987,6 +987,108 @@ class InventoryWindow(QMainWindow):
         self._apply_filters()
         self._status(f"📱 Применено: {applied_manual} точных + {applied_singles} одиночных + {applied_algo} групп (алгоритм)")
 
+
+    # ============================================================
+    #  🆕 v1.5.0: СОХРАНЕНИЕ refState + ОТПРАВКА В TELEGRAM
+    # ============================================================
+    def _save_ref_state_and_send_telegram(
+        self,
+        trouble_result,
+        all_products: list,
+        pdf_path: str,
+        financial_summary: dict,
+    ):
+        """
+        Сохраняет refStateGeneral + refStateDetailed в БД
+        и отправляет отчёт с PDF в Telegram-топик филиала.
+        
+        Срабатывает только если есть товары на ручной проверке (allRef).
+        Ошибки не критичные — закрытие смены продолжается даже при сбое Telegram.
+        """
+        if not trouble_result:
+            print("[RefState] ⏭ Нет trouble_result — пропуск")
+            return
+        
+        all_ref = trouble_result.get("allRef", [])
+        if not all_ref:
+            print("[RefState] ⏭ Нет товаров на проверке (allRef пустой) — пропуск")
+            return
+        
+        # === Собираем данные для general ===
+        point_name = current_session.point_name or "Неизвестная точка"
+        administrator = current_session.giver or "Неизвестный"
+        session_label = current_session.shift_label or ""
+        date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+        
+        # Уникальные виды товара (по title)
+        unique_titles = set(
+            r.get("product_title") or r.get("title") or "" 
+            for r in all_ref
+        )
+        unique_titles.discard("")
+        total_types = len(unique_titles)
+        
+        # Общее количество позиций
+        total_items = sum(r.get("quantity", 0) for r in all_ref)
+        
+        # Общая сумма
+        total_value = sum(r.get("value", 0) for r in all_ref)
+        
+        # Количество товаров на проверке
+        items_on_check = len(all_ref)
+        
+        # Уникальные ссылки
+        unique_refs = list(set(
+            r.get("reference") for r in all_ref 
+            if r.get("reference")
+        ))
+        links_count = len(unique_refs)
+        
+        # === 1. Сохраняем refStateGeneral ===
+        repo = RefStateRepository()
+        general_data = {
+            "point_name": point_name,
+            "administrator": administrator,
+            "session_label": session_label,
+            "total_types": total_types,
+            "total_items": total_items,
+            "total_value": total_value,
+            "items_on_check": items_on_check,
+            "links_count": links_count,
+            "pdf_path": pdf_path,
+        }
+        general_result = repo.save_general(general_data)
+        
+        # === 2. Сохраняем refStateDetailed ===
+        if general_result.get("success"):
+            general_id = general_result["id"]
+            detailed_items = []
+            for ref in all_ref:
+                detailed_items.append({
+                    "administrator": administrator,
+                    "product_title": ref.get("product_title") or ref.get("title") or "—",
+                    "product_id": ref.get("product_id"),
+                    "reference": ref.get("reference") or "",
+                    "quantity": ref.get("quantity", 0),
+                    "value": ref.get("value", 0),
+                    "reason": ref.get("reason") or "",
+                })
+            repo.save_detailed(general_id, detailed_items)
+        
+        # === 3. Отправляем в Telegram (с PDF) ===
+        telegram = TelegramService()
+        telegram.send_ref_state_report(
+            point_name=point_name,
+            administrator=administrator,
+            date_str=date_str,
+            total_types=total_types,
+            total_items=total_items,
+            total_value=total_value,
+            items_on_check=items_on_check,
+            references=unique_refs,
+            pdf_path=pdf_path,  # ← если PDF есть, отправится с caption
+        )
+
     # ============================================================
     #  🔒 БЕЗОПАСНОЕ ЗАКРЫТИЕ ПЕРЕСЧЁТА
     # ============================================================
@@ -1086,6 +1188,8 @@ class InventoryWindow(QMainWindow):
         from gui.trouble_dialog import TroubleDialog
         from core.report_generator import generate_normalization_report
         from core.inventory_repository import InventoryRepository
+        from core.ref_state_repository import RefStateRepository
+        from core.telegram_service import TelegramService
 
         all_products = goods_cache.get_all_products() if goods_cache.is_loaded() else []
         service = NormalizationService(self.client)
@@ -1229,6 +1333,19 @@ class InventoryWindow(QMainWindow):
                     print(f"[Report] ✗ Ошибка генерации PDF: {e}")
                     import traceback; traceback.print_exc()
 
+                progress_dialog.setLabelText("📱 Отправка отчёта в Telegram...")
+                progress_dialog.setValue(60); QApplication.processEvents()
+                try:
+                    self._save_ref_state_and_send_telegram(
+                        trouble_result=trouble_result,
+                        all_products=all_products,
+                        pdf_path=pdf_path,
+                        financial_summary=financial_summary,
+                    )
+                except Exception as e:
+                    print(f"[RefState/Telegram] ✗ Ошибка (не критично): {e}")
+                    import traceback; traceback.print_exc()
+
                 try: service.sync_products_to_db(all_products)
                 except Exception as e: print(f"[DB] ✗ Ошибка синхронизации товаров: {e}")
 
@@ -1351,6 +1468,8 @@ class InventoryWindow(QMainWindow):
             import traceback; traceback.print_exc()
 
         self.close()
+
+
 
     def _sync_actuals_from_table(self):
         def sync_item(item):

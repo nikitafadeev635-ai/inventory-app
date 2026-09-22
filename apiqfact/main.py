@@ -31,6 +31,7 @@ import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
+from fastapi import UploadFile, File, Form
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -1777,6 +1778,102 @@ async def send_ref_state_telegram(
         })
     
     return result
+
+# ============================================================
+# 🆕 v1.5.0: Telegram — отправка PDF с caption (подписью)
+# ============================================================
+from fastapi import UploadFile, File, Form
+
+@app.post("/api/telegram/send-ref-state-with-pdf")
+async def send_ref_state_with_pdf(
+    request: Request,
+    user: dict = Depends(get_current_user),
+    point_name: str = Form(...),
+    message: str = Form(...),
+    parse_mode: str = Form("HTML"),
+    pdf_file: UploadFile = File(...),
+):
+    """
+    Отправляет PDF-отчёт в Telegram топик конкретной точки
+    с текстом отчёта в качестве подписи (caption).
+    """
+    # Проверка topic_id
+    topic_id = TELEGRAM_TOPIC_MAP.get(point_name)
+    if not topic_id or topic_id <= 0:
+        return {
+            "success": False,
+            "error": f"no valid topic_id for '{point_name}'"
+        }
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return {"success": False, "error": "bot/chat_id not configured"}
+    
+    # Проверка размера файла (Telegram limit = 50MB)
+    content = await pdf_file.read()
+    file_size = len(content)
+    if file_size > 50 * 1024 * 1024:
+        return {"success": False, "error": "file too large (>50MB)"}
+    
+    # Проверка длины caption (Telegram limit = 1024 chars)
+    caption = message
+    caption_truncated = False
+    if len(caption) > 1024:
+        caption = caption[:1020] + "..."
+        caption_truncated = True
+        logger.warning(
+            f"[Telegram] ⚠ Caption обрезан с {len(message)} до 1024 символов"
+        )
+    
+    try:
+        import io
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        
+        # multipart/form-data для Telegram
+        files = {
+            "document": (
+                pdf_file.filename or "report.pdf",
+                io.BytesIO(content),
+                "application/pdf"
+            )
+        }
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_thread_id": topic_id,
+            "caption": caption,
+            "parse_mode": parse_mode,
+        }
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, data=data, files=files)
+            
+            if r.status_code == 200:
+                result_data = r.json()
+                message_id = result_data.get("result", {}).get("message_id")
+                logger.info(
+                    f"[Telegram] ✓ PDF отправлен в топик '{point_name}' "
+                    f"(topic_id={topic_id}, message_id={message_id}, "
+                    f"size={file_size} bytes)"
+                )
+                return {
+                    "success": True,
+                    "message_id": message_id,
+                    "file_size": file_size,
+                    "caption_truncated": caption_truncated,
+                }
+            else:
+                logger.error(
+                    f"[Telegram] ✗ HTTP {r.status_code}: {r.text[:500]}"
+                )
+                return {"success": False, "error": f"HTTP {r.status_code}"}
+    
+    except httpx.TimeoutException:
+        logger.error(f"[Telegram] ✗ Timeout при отправке PDF в {point_name}")
+        return {"success": False, "error": "timeout"}
+    except Exception as e:
+        logger.error(f"[Telegram] ✗ Ошибка отправки PDF: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
 # ============================================================
 #  ЗАПУСК
