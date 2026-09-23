@@ -33,63 +33,6 @@
 - 📨 **Telegram-алерты** — уведомления о попытках взлома
 - 🗄️ **MySQL-хранилище** — все операции сохраняются в БД
 
----
-
-## 🏗️ Архитектура
-┌──────────────────────┐ HTTPS ┌──────────────────────┐
-│ КЛИЕНТ (Windows) │ ◄──────────────────► │ VPS (78.17.47.74) │
-│ │ │ │
-│ • PyQt6 GUI │ POST /api/... │ • FastAPI │
-│ • httpx │ │ • Uvicorn + TLS │
-│ • локальный кэш │ ◄── JWT / JSON ──► │ • bcrypt + JWT │
-│ │ │ • IP-whitelist │
-└──────────────────────┘ └──────────┬───────────┘
-│
-▼
-┌──────────────────────┐
-│ MySQL (TimeWeb) │
-│ • employees │
-│ • inventory_* │
-│ • refState* │
-│ • audit_log │
-└──────────┬───────────┘
-│
-▼
-┌──────────────────────┐
-│ SmartShell GraphQL │
-│ • товары │
-│ • операции │
-└──────────────────────┘
-
-### Уровни защиты
-
-Запрос клиента
-│
-▼
-┌────────────────────────┐
-│ 1. IP-whitelist │─── IP не в списке ──► 🚫 403 Forbidden
-│ (middleware) │
-└──────────┬─────────────┘
-│ ✓
-▼
-┌────────────────────────┐
-│ 2. X-API-Key │─── Неверный ключ ──► 🚫 401 Unauthorized
-│ (middleware) │
-└──────────┬─────────────┘
-│ ✓
-▼
-┌────────────────────────┐
-│ 3. JWT (если требуется)│─── Неверный токен ──► 🚫 401
-│ (Depends) │
-└──────────┬─────────────┘
-│ ✓
-▼
-Обработка запроса
-
----
-
-## 🛠️ Технологии
-
 ### Клиент
 
 | Технология | Назначение |
@@ -119,60 +62,6 @@
 - **База данных:** MySQL на TimeWeb (`vh454.timeweb.ru`)
 - **SSL:** самоподписанный сертификат (отключена проверка на клиенте)
 - **Systemd:** `qfact-api.service` для автозапуска
-
----
-
-## 📁 Структура проекта
-
-inventory_app/
-├── main.py # Точка входа клиента
-├── config.py # Конфигурация (URL, API keys)
-├── README.md # Этот файл
-│
-├── apiqfact/ # 🖥️ Серверный код (для VPS)
-│ ├── main.py # FastAPI-приложение
-│ ├── .env # Секреты и конфиг VPS
-│ ├── migrate_passwords.py # Миграция паролей на bcrypt
-│ ├── reset_password.py # Сброс пароля сотрудника
-│ ├── add_employee.py # Добавление сотрудника
-│ ├── certs/ # SSL-сертификаты
-│ │ ├── server.crt
-│ │ └── server.key
-│ └── logs/ # Серверные логи
-│ └── server.log
-│
-├── core/ # 🔧 Бизнес-логика
-│ ├── api_client.py # HTTP-клиент к VPS
-│ ├── normalization.py # Сервис нормализации
-│ ├── session.py # Сессия пользователя
-│ ├── goods_cache.py # Кэш товаров
-│ ├── product_group.py # Логика группировки
-│ ├── telegram_service.py # Отправка в Telegram
-│ ├── ref_state_repository.py # Работа с refState*
-│ ├── inventory_repository.py # Работа с inventory_*
-│ ├── report_generator.py # PDF-отчёты (reportlab)
-│ └── sync_server.py # Сервер синхронизации
-│
-├── gui/ # 🎨 PyQt6 интерфейс
-│ ├── inventory_window.py # Главное окно инвентаризации
-│ ├── login_widget.py # Авторизация
-│ ├── handover_dialog.py # Диалог пересменки
-│ ├── normalization_dialog.py # План нормализации
-│ ├── trouble_dialog.py # Причины расхождений
-│ ├── completion_dialog.py # Итоги смены
-│ ├── sync_qr_dialog.py # QR-код синхронизации
-│ ├── inventory_customizer.py # Редактор темы
-│ ├── gif_background.py # Анимированный фон
-│ ├── styles.py # SmartShellColors
-│ └── themes.py # Менеджер тем
-│
-├── items/ # 📦 Модели данных
-│ ├── product.py # Товар
-│ └── product_group.py # Группа товаров (бренд)
-│
-└── reports/ # 📊 Сгенерированные PDF
-└── *.pdf
-
 
 ---
 
@@ -215,7 +104,6 @@ inventory_app/
 | Ульяновская 8 | Владивосток | `ip` |
 
 **Дополнительно:** `ADMIN_IPS` для разработчиков (динамические IP).
-
 ---
 
 ## 🚀 Установка клиента
