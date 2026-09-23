@@ -359,6 +359,10 @@ async def security_middleware(request: Request, call_next):
     # === Уровень 0: Healthcheck открыт всем (для мониторинга) ===
     if path == "/":
         return await call_next(request)
+
+    if path.startswith("/api/debug/"):
+        logger.info(f"[Debug] Диагностика: {client_ip} → {path}")
+        return await call_next(request)
     
     # === Уровень 1: Проверка IP ===
     if ALLOWED_NETWORKS or ADMIN_NETWORKS:
@@ -880,6 +884,99 @@ async def change_quantity_ss(
 # ============================================================
 #  РОУТЫ
 # ============================================================
+# ============================================================
+# 🔬 ДИАГНОСТИКА: определение IP клиента
+# ============================================================
+@app.get("/api/debug/ip")
+async def debug_ip(request: Request):
+    """
+    Возвращает все IP-заголовки и информацию о подключении.
+    Используется для диагностики IP-whitelist.
+    """
+    # Все возможные источники IP
+    headers_info = {}
+    ip_headers = [
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-client-ip",
+        "cf-connecting-ip",
+        "x-cluster-client-ip",
+        "forwarded",
+        "true-client-ip",
+        "x-appengine-user-ip",
+    ]
+    
+    for header in ip_headers:
+        value = request.headers.get(header)
+        if value:
+            headers_info[header] = value
+    
+    # Информация о подключении
+    client_info = {
+        "direct_ip": request.client.host if request.client else None,
+        "port": request.client.port if request.client else None,
+        "ip_headers": headers_info,
+        "first_forwarded_ip": None,
+        "server_time": datetime.now().isoformat(),
+    }
+    
+    # Парсим X-Forwarded-For (первый IP = реальный клиент)
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        first_ip = forwarded.split(",")[0].strip()
+        client_info["first_forwarded_ip"] = first_ip
+    
+    # Проверяем в whitelist
+    real_ip = client_info["first_forwarded_ip"] or client_info["direct_ip"]
+    is_allowed = False
+    is_admin = False
+    matched_network = None
+    
+    if real_ip:
+        try:
+            client_addr = ipaddress.ip_address(real_ip)
+            for net in ALLOWED_NETWORKS:
+                if client_addr in net:
+                    is_allowed = True
+                    matched_network = str(net)
+                    break
+            for net in ADMIN_NETWORKS:
+                if client_addr in net:
+                    is_admin = True
+                    matched_network = str(net)
+                    break
+        except Exception:
+            pass
+    
+    client_info["whitelist_check"] = {
+        "ip_being_checked": real_ip,
+        "is_allowed": is_allowed,
+        "is_admin": is_admin,
+        "matched_network": matched_network,
+        "allowed_networks": [str(n) for n in ALLOWED_NETWORKS],
+        "admin_networks": [str(n) for n in ADMIN_NETWORKS],
+    }
+    
+    logger.info(
+        f"[Debug] IP request: direct={client_info['direct_ip']}, "
+        f"forwarded={client_info['first_forwarded_ip']}, "
+        f"allowed={is_allowed}, admin={is_admin}"
+    )
+    
+    return client_info
+
+
+@app.get("/api/debug/headers")
+async def debug_headers(request: Request):
+    """Возвращает все заголовки запроса (для полной диагностики)."""
+    return {
+        "headers": dict(request.headers),
+        "client_host": request.client.host if request.client else None,
+        "client_port": request.client.port if request.client else None,
+        "url": str(request.url),
+        "method": request.method,
+    }
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "QFact API", "version": "1.6.0"}
