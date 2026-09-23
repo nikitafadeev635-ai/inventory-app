@@ -13,6 +13,12 @@ from core.normalization import (REASONS_LESS, REASONS_MORE,
                                  ALL_EXCUSABLE_REASONS)
 from gui.styles import SmartShellColors
 
+REQUIRED_LINK_REASONS = {
+    "Не знаю",
+    "Товар украден",
+    "Не прошла корректно оплата",
+    "Просрочка",
+}
 
 class TroubleBlock:
     """Один блок разбиения (количество + причина + ссылка)."""
@@ -133,15 +139,67 @@ class TroubleBlockWidget(QWidget):
         layout.addWidget(self.remove_btn)
 
     def _on_field_changed(self, *args):
+        """Обновляет данные блока и вызывает валидацию."""
         self.block.quantity = self.qty_spin.value()
         self.block.reason = self.reason_combo.currentText()
         self.block.reference = self.ref_edit.text().strip()
+        
+        # 🆕 Визуальная индикация: красная рамка если обязательная ссылка пустая
+        self._update_reference_visual()
+        
         self._on_changed()
 
+
+    def _update_reference_visual(self):
+        """Обновляет визуальное состояние поля ссылки."""
+        p = SmartShellColors
+        reason = self.block.reason
+        reference = self.block.reference.strip()
+        
+        if reason in REQUIRED_LINK_REASONS and not reference:
+            # 🔴 Красная рамка — обязательная ссылка не заполнена
+            self.ref_edit.setStyleSheet(f"""
+                QLineEdit {{
+                    background: {p.bg_item_primary};
+                    color: {p.text_primary};
+                    border: 2px solid #e74c3c;
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                }}
+            """)
+            self.ref_edit.setToolTip("⚠️ Обязательно укажите ссылку для этой причины")
+        else:
+            # ✅ Обычный стиль
+            self.ref_edit.setStyleSheet(f"""
+                QLineEdit {{
+                    background: {p.bg_item_primary};
+                    color: {p.text_primary};
+                    border: 1px solid {p.border_gray_20};
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                }}
+            """)
+            self.ref_edit.setToolTip("")
+
     def is_valid(self) -> tuple:
-        if self.block.reason in ALL_EXCUSABLE_REASONS:
-            if not self.block.reference:
-                return False, f"Для причины '{self.block.reason}' обязательна ссылка"
+        """
+        Проверяет валидность блока.
+        Возвращает (is_valid: bool, error_message: str)
+        """
+        reason = self.block.reason
+        reference = self.block.reference.strip()
+        
+        # Проверка 1: Для обязательных причин ссылка НЕОБХОДИМА
+        if reason in REQUIRED_LINK_REASONS:
+            if not reference:
+                return False, f"Для причины '{reason}' обязательна ссылка"
+        
+        # Проверка 2: Для уважительных причин (ALL_EXCUSABLE_REASONS) ссылка тоже нужна
+        # (это существующая логика для определения "на проверке" vs "к оплате")
+        if reason in ALL_EXCUSABLE_REASONS:
+            if not reference:
+                return False, f"Для причины '{reason}' обязательна ссылка"
+        
         return True, ""
 
 
@@ -447,6 +505,72 @@ class TroubleDialog(QDialog):
                 f"💰 Итого: {self.total_cost:.2f} ₽ "
                 f"(оплата: {not_sure:.2f}, на проверке: {excused:.2f})"
             )
+        
+        # 🆕 Обновляем состояние кнопки подтверждения
+        self._update_confirm_button_state()
+
+    def _update_confirm_button_state(self):
+        """
+        Обновляет состояние кнопки "Подтвердить и сохранить".
+        Блокирует если есть обязательные причины без ссылок.
+        """
+        p = SmartShellColors
+        all_valid = True
+        
+        # Проверяем все блоки во всех группах
+        for widget in self._group_widgets:
+            for bw in widget._block_widgets:
+                valid, _ = bw.is_valid()
+                if not valid:
+                    all_valid = False
+                    break
+            if not all_valid:
+                break
+        
+        # Обновляем состояние кнопки
+        if all_valid:
+            # ✅ Активная кнопка — акцентный цвет
+            self.confirm_btn.setEnabled(True)
+            self.confirm_btn.setStyleSheet("""
+                QPushButton {
+                    background: #2C87FD;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 12px 24px;
+                    font-weight: 600;
+                }
+                QPushButton:hover {
+                    background: #1a6fd4;
+                }
+                QPushButton:pressed {
+                    background: #0f5ba8;
+                }
+            """)
+            self.confirm_btn.setToolTip("Подтвердить и сохранить причины расхождений")
+        else:
+            # ❌ Неактивная кнопка — серый цвет
+            self.confirm_btn.setEnabled(False)
+            self.confirm_btn.setStyleSheet("""
+                QPushButton {
+                    background: #555555;
+                    color: #999999;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 12px 24px;
+                    font-weight: 600;
+                }
+                QPushButton:hover {
+                    background: #555555;
+                }
+            """)
+            self.confirm_btn.setToolTip(
+                "⚠️ Заполните ссылки для обязательных причин:\n"
+                "• Не знаю\n"
+                "• Товар украден\n"
+                "• Не прошла корректно оплата\n"
+                "• Просрочка"
+            )
 
     def _on_confirm(self):
         # 1. Проверка разбиения
@@ -461,13 +585,13 @@ class TroubleDialog(QDialog):
                 )
                 return
 
-        # 2. Валидность блоков
+        # 2. Проверка валидности блоков (обязательные ссылки заполнены)
         for widget in self._group_widgets:
             for bw in widget._block_widgets:
                 valid, msg = bw.is_valid()
                 if not valid:
                     QMessageBox.warning(
-                        self, "Ошибка блока",
+                        self, "Ошибка валидации",
                         f"Группа '{widget.group.group_name}':\n{msg}"
                     )
                     return
