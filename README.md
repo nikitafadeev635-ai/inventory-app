@@ -1,158 +1,249 @@
-# 📦 Inventory App (QFact)
+# 📦 CyberMG Inventory App
 
-Система инвентаризации для сети магазинов CyberMG. 
-Автоматизация пересменки с интеграцией SmartShell, синхронизацией с мобильным устройством, 
-финансовой ответственностью и PDF-отчётами.
+Десктопное приложение для инвентаризации товаров в точках CyberMG с серверным API-прокси для безопасного взаимодействия со SmartShell.
+
+**Версия:** 1.6.0  
+**Последнее обновление:** 23.09.2026
+
+---
+
+## 🎯 Возможности
+
+### Клиент (Windows / PyQt6)
+
+- 📋 **Инвентаризация** — учёт товаров с группировкой по брендам
+- 🔄 **Нормализация** — пакетная обработка расхождений (DISPOSAL / ADD)
+- 💰 **Финансовая ответственность** — расчёт сумм к списанию с учётом пересортицы
+- 🔍 **Trouble Dialog** — указание причин недостач со ссылками-подтверждениями
+- 📱 **Telegram-интеграция** — отправка PDF-отчётов в топики филиалов
+- 🎨 **Темы и кастомизация** — SmartShell Dark + визуальный редактор цветов
+- 📲 **Мобильная синхронизация** — QR-код для подключения телефонов
+- 📊 **PDF-отчёты** — детализация расхождений с финансовой разбивкой
+- ✅ **Автозаполнение** — автоматическое проставление `actual = stock` для сиблингов в группе
+- 🖼️ **GIF-фон** — анимированный фон с настраиваемой прозрачностью
+
+### Сервер (VPS / FastAPI)
+
+- 🔐 **IP-whitelist** — доступ только с IP филиалов (6 адресов)
+- 🔑 **bcrypt пароли** — безопасное хранение паролей сотрудников (12 раундов)
+- ⏱️ **Rate limiting** — защита от брутфорса (5 попыток / 15 минут)
+- 🎫 **JWT-токены** — авторизация на 12 часов
+- 🚀 **Пакетная обработка** — 1 HTTP-запрос к SmartShell на 100+ товаров
+- 📝 **Audit log** — полная история всех операций
+- 📨 **Telegram-алерты** — уведомления о попытках взлома
+- 🗄️ **MySQL-хранилище** — все операции сохраняются в БД
+
+---
 
 ## 🏗️ Архитектура
-
-```
-┌─────────────────┐      ┌──────────────┐      ┌──────────────┐
-│  ПК (PyQt6)     │ ───► │ VPS (FastAPI)│ ───► │  SmartShell  │
-│  inventory_app  │      │ apiqfact     │      │  (GraphQL)   │
-└────────┬────────┘      └──────┬───────┘      └──────────────┘
-         │                       │
-         │ sync_server           │
-         │ (localhost:8080)      ▼
-         │                 ┌──────────┐
-         ▼                 │  MySQL   │
-┌─────────────────┐        │  (БД)    │
-│  📱 Телефон     │        └──────────┘
-│  (мобильный     │
-│   веб-интерфейс)│
-└─────────────────┘
-```
-
-## 📁 Структура проекта
-
-```
-inventory_app/
-├── main.py                         # Точка входа
-├── config.py                       # Конфигурация (URL, warehouse_ids)
-├── .env                            # Секреты (НЕ в Git!)
-├── .env.example                    # Шаблон секретов
+┌──────────────────────┐ HTTPS ┌──────────────────────┐
+│ КЛИЕНТ (Windows) │ ◄──────────────────► │ VPS (78.17.47.74) │
+│ │ │ │
+│ • PyQt6 GUI │ POST /api/... │ • FastAPI │
+│ • httpx │ │ • Uvicorn + TLS │
+│ • локальный кэш │ ◄── JWT / JSON ──► │ • bcrypt + JWT │
+│ │ │ • IP-whitelist │
+└──────────────────────┘ └──────────┬───────────┘
 │
-├── items/
-│   └── product.py                  # Модель Product
+▼
+┌──────────────────────┐
+│ MySQL (TimeWeb) │
+│ • employees │
+│ • inventory_* │
+│ • refState* │
+│ • audit_log │
+└──────────┬───────────┘
 │
-├── core/                           # Ядро бизнес-логики
-│   ├── session.py                  # current_session (Singleton)
-│   ├── goods_cache.py              # Кеш товаров и групп
-│   ├── product_group.py            # ProductGroup (группы брендов)
-│   ├── product_grouper.py          # Группировка по брендам
-│   ├── normalization.py            # NormalizationService (план/применение/верификация)
-│   ├── normalization_verifier.py   # Верификация в SmartShell
-│   ├── sync_server.py              # Локальный сервер для телефона (FastAPI)
-│   ├── inventory_repository.py     # Сохранение в БД через VPS
-│   ├── report_generator.py         # PDF-отчёты (ReportLab)
-│   ├── database.py                 # Локальная SQLite
-│   └── api_client.py               # HTTP-клиент к VPS
+▼
+┌──────────────────────┐
+│ SmartShell GraphQL │
+│ • товары │
+│ • операции │
+└──────────────────────┘
+
+### Уровни защиты
+
+Запрос клиента
 │
-├── gui/                            # Интерфейс (PyQt6)
-│   ├── inventory_window.py         # Главное окно пересчёта
-│   ├── normalization_dialog.py     # План нормализации
-│   ├── trouble_dialog.py           # Причины расхождений
-│   ├── verification_dialog.py      # Ручная верификация
-│   ├── completion_dialog.py        # Финальный чеклист
-│   ├── sync_qr_dialog.py           # QR-код для телефона
-│   ├── inventory_customizer.py     # Настройка темы
-│   ├── styles.py                   # SmartShellColors
-│   ├── themes.py                   # theme_manager
-│   └── gif_background.py           # Анимированный фон
-│
-├── reports/                        # PDF-отчёты (не в Git)
-└── docs/                           # Документация
-    ├── architecture.md
-    └── deployment.md
-```
+▼
+┌────────────────────────┐
+│ 1. IP-whitelist │─── IP не в списке ──► 🚫 403 Forbidden
+│ (middleware) │
+└──────────┬─────────────┘
+│ ✓
+▼
+┌────────────────────────┐
+│ 2. X-API-Key │─── Неверный ключ ──► 🚫 401 Unauthorized
+│ (middleware) │
+└──────────┬─────────────┘
+│ ✓
+▼
+┌────────────────────────┐
+│ 3. JWT (если требуется)│─── Неверный токен ──► 🚫 401
+│ (Depends) │
+└──────────┬─────────────┘
+│ ✓
+▼
+Обработка запроса
 
-## 🚀 Быстрый старт
-
-### Установка
-```bash
-git clone https://github.com/nikitafadeev635-ai/inventory-app.git
-cd inventory-app
-pip install -r requirements.txt
-cp .env.example .env
-# Заполни .env реальными данными
-```
-
-### Запуск
-```bash
-python main.py
-```
-
-## 🔐 Конфигурация (.env)
-
-```env
-SMARTSHELL_GRAPHQL_URL=https://billing.smartshell.gg/api/graphql
-SS_MASTER_LOGIN=your_login
-SS_MASTER_PASSWORD=your_password
-PROXY_SERVER_URL=https://your-vps:8443
-API_SECRET_KEY=random_string
-JWT_SECRET=random_string
-WAREHOUSE_RUSSKAYA=1598
-WAREHOUSE_SAHALINSKAYA=3241
-WAREHOUSE_TRAMVAYNAYA=2610
-WAREHOUSE_SVETLAYA=7879
-WAREHOUSE_ULYANOVSKAYA=4532
-WAREHOUSE_KALININA=10178
-```
-
-## 📊 Ключевые возможности
-
-- ✅ Пересчёт с группировкой по брендам
-- ✅ Синхронизация с телефоном (QR-код, веб-интерфейс)
-- ✅ Адаптация факта при продаже во время пересчёта
-- ✅ Калькулятор в мобильном интерфейсе
-- ✅ Нормализация расхождений (списание/внесение)
-- ✅ TroubleDialog с причинами и ссылками
-- ✅ PDF-отчёты с кириллицей
-- ✅ Финансовая ответственность (к оплате / на проверке)
-- ✅ Безопасное закрытие (БД → PDF → SmartShell)
-- ✅ CompletionDialog с чеклистом этапов
+---
 
 ## 🛠️ Технологии
 
-- **Клиент:** Python 3.14, PyQt6, ReportLab
-- **Сервер:** FastAPI, Uvicorn, PyMySQL, httpx
-- **БД:** MySQL 8.0 (VPS), SQLite (локально)
-- **Синхронизация:** FastAPI + WebSocket (локально)
-- **Интеграция:** SmartShell GraphQL API
+### Клиент
 
-## 🔒 Безопасность
+| Технология | Назначение |
+|------------|-----------|
+| Python 3.14 | Язык программирования |
+| PyQt6 | GUI-фреймворк |
+| httpx | Асинхронные HTTP-запросы |
+| reportlab | Генерация PDF-отчётов |
+| python-dotenv | Загрузка конфигурации |
 
-- Все секреты в `.env` (не коммитится!)
-- Клиент не имеет прямого доступа к SmartShell и БД
-- Все операции проксируются через VPS
-- JWT аутентификация
+### Сервер
 
-## 📝 Версионирование
+| Технология | Назначение |
+|------------|-----------|
+| FastAPI | Web-фреймворк (ASGI) |
+| Uvicorn | ASGI-сервер |
+| PyMySQL | Подключение к MySQL |
+| bcrypt | Хеширование паролей |
+| PyJWT | Выпуск/проверка JWT |
+| httpx | Прокси-запросы к SmartShell |
+| ipaddress | Работа с IP-сетями |
 
-Проект использует **Semantic Versioning** + **Conventional Commits**:
+### Инфраструктура
 
-- `feat:` — новая функциональность
-- `fix:` — исправление бага
-- `docs:` — изменения в документации
-- `refactor:` — рефакторинг
-- `chore:` — обслуживание
+- **VPS:** Debian GNU/Linux
+- **Хостинг VPS:** выделенный сервер (78.17.47.74)
+- **База данных:** MySQL на TimeWeb (`vh454.timeweb.ru`)
+- **SSL:** самоподписанный сертификат (отключена проверка на клиенте)
+- **Systemd:** `qfact-api.service` для автозапуска
 
-Примеры коммитов:
+---
+
+## 📁 Структура проекта
+
+inventory_app/
+├── main.py # Точка входа клиента
+├── config.py # Конфигурация (URL, API keys)
+├── README.md # Этот файл
+│
+├── apiqfact/ # 🖥️ Серверный код (для VPS)
+│ ├── main.py # FastAPI-приложение
+│ ├── .env # Секреты и конфиг VPS
+│ ├── migrate_passwords.py # Миграция паролей на bcrypt
+│ ├── reset_password.py # Сброс пароля сотрудника
+│ ├── add_employee.py # Добавление сотрудника
+│ ├── certs/ # SSL-сертификаты
+│ │ ├── server.crt
+│ │ └── server.key
+│ └── logs/ # Серверные логи
+│ └── server.log
+│
+├── core/ # 🔧 Бизнес-логика
+│ ├── api_client.py # HTTP-клиент к VPS
+│ ├── normalization.py # Сервис нормализации
+│ ├── session.py # Сессия пользователя
+│ ├── goods_cache.py # Кэш товаров
+│ ├── product_group.py # Логика группировки
+│ ├── telegram_service.py # Отправка в Telegram
+│ ├── ref_state_repository.py # Работа с refState*
+│ ├── inventory_repository.py # Работа с inventory_*
+│ ├── report_generator.py # PDF-отчёты (reportlab)
+│ └── sync_server.py # Сервер синхронизации
+│
+├── gui/ # 🎨 PyQt6 интерфейс
+│ ├── inventory_window.py # Главное окно инвентаризации
+│ ├── login_widget.py # Авторизация
+│ ├── handover_dialog.py # Диалог пересменки
+│ ├── normalization_dialog.py # План нормализации
+│ ├── trouble_dialog.py # Причины расхождений
+│ ├── completion_dialog.py # Итоги смены
+│ ├── sync_qr_dialog.py # QR-код синхронизации
+│ ├── inventory_customizer.py # Редактор темы
+│ ├── gif_background.py # Анимированный фон
+│ ├── styles.py # SmartShellColors
+│ └── themes.py # Менеджер тем
+│
+├── items/ # 📦 Модели данных
+│ ├── product.py # Товар
+│ └── product_group.py # Группа товаров (бренд)
+│
+└── reports/ # 📊 Сгенерированные PDF
+└── *.pdf
+
+
+---
+
+## 🔐 Безопасность
+
+### Трёхуровневая защита API
+
+| Уровень | Механизм | Назначение |
+|---------|----------|------------|
+| **1. IP-whitelist** | Middleware `security_middleware` | Разрешены только IP 6 филиалов + админские IP |
+| **2. API-Key** | HTTP-заголовок `X-API-Key` | Проверка легитимности клиента |
+| **3. JWT** | Bearer-токен (HS256) | Авторизация конкретного сотрудника (12 часов) |
+
+### Rate Limiting
+
+- **5 неудачных попыток** за 15 минут на пару `(IP, faname)`
+- **Блокировка на 15 минут** при превышении
+- **Telegram-алерт** администратору при блокировке
+- **Сброс счётчика** при успешном входе
+- **HTTP 429** с заголовком `Retry-After` при блокировке
+
+### Хеширование паролей (bcrypt)
+
+- Алгоритм: `bcrypt` с **12 раундами**
+- Поддержка обратной совместимости с plaintext (для миграции)
+- Автоматическое определение формата по префиксу `$2b$` / `$2a$` / `$2y$`
+- Инструменты: `migrate_passwords.py`, `reset_password.py`, `add_employee.py`
+
+### IP-whitelist
+
+**Разрешённые IP филиалов CyberMG:**
+
+| Филиал | Адрес | IP |
+|--------|-------|:---:|
+| Калининa 283а | Владивосток | `ip` |
+| Русская 17/1 | Владивосток | `ip` |
+| Сахалинская 50в | Владивосток | `ip` |
+| Светланская 21 | Владивосток | `ip` |
+| Трамвайная 14 | Владивосток | `ip` |
+| Ульяновская 8 | Владивосток | `ip` |
+
+**Дополнительно:** `ADMIN_IPS` для разработчиков (динамические IP).
+
+---
+
+## 🚀 Установка клиента
+
+### Требования
+
+- Windows 10/11
+- Python 3.11+
+- Доступ к VPS по HTTPS
+
+### Шаги
+
 ```bash
-git commit -m "feat(sync): add client-side stock adaptation"
-git commit -m "fix(ui): align columns in inventory table"
-git commit -m "docs: add deployment guide"
-```
+# 1. Клонировать репозиторий
+git clone <repo-url>
+cd inventory_app
 
-## 👥 Как работать с проектом (для AI)
+# 2. Создать виртуальное окружение
+python -m venv venv
+venv\Scripts\activate
 
-Если вы AI-ассистент и получаете ссылку на этот репозиторий:
+# 3. Установить зависимости
+pip install PyQt6 httpx pyjwt reportlab python-dotenv
 
-1. Изучите `README.md` (этот файл)
-2. Прочитайте `docs/architecture.md` для понимания связей модулей
-3. Используйте `grep`/`find` для поиска конкретных функций
-4. Проверяйте `CHANGELOG.md` для истории изменений
+# 4. Настроить config.py
+#    - PROXY_SERVER_URL = "https://78.17.47.74:8443"
+#    - API_SECRET_KEY = "<ключ с VPS>"
+#    - SMARTSHELL_WAREHOUSE_IDS = {...}
 
-## 📄 Лицензия
-
-Proprietary © CyberMG 2024
+# 5. Запустить
+python main.py
