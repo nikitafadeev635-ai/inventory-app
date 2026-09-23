@@ -514,7 +514,10 @@ class TroubleDialog(QDialog):
         Обновляет состояние кнопки "Подтвердить и сохранить".
         Блокирует если есть обязательные причины без ссылок.
         """
-        p = SmartShellColors
+        # 🆕 Защита: кнопка может быть ещё не создана при инициализации
+        if not hasattr(self, 'confirm_btn') or self.confirm_btn is None:
+            return
+        
         all_valid = True
         
         # Проверяем все блоки во всех группах
@@ -571,7 +574,7 @@ class TroubleDialog(QDialog):
                 "• Не прошла корректно оплата\n"
                 "• Просрочка"
             )
-
+            
     def _on_confirm(self):
         # 1. Проверка разбиения
         for widget in self._group_widgets:
