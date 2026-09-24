@@ -990,107 +990,92 @@ class InventoryWindow(QMainWindow):
     # ============================================================
     #  🆕 v1.5.3: СОХРАНЕНИЕ refState + ОТПРАВКА В TELEGRAM
     # ============================================================
+
     def _save_ref_state_and_send_telegram(
         self,
         trouble_result,
         all_products: list,
         pdf_path: str,
         financial_summary: dict,
-        plan,  # 🆕 ОБЯЗАТЕЛЬНО: план нормализации
+        plan,
     ):
         """
-        v1.5.3: Отправляет отчёт о смене СТРОГО ПО ШАБЛОНУ.
-        Данные берутся из ПЛАНА НОРМАЛИЗАЦИИ (DISPOSAL = реальные минусы).
-        
-        Формат сообщения:
-            <Дата> <Отдающий смену>
-            <N видов>, <M позиций>, <сумма минусов>
-            Переданные товары на проверку: <K>
-            
-            Ссылки:
-            • <группа> (<кол-во> шт): <ссылка>
+        v1.5.4: Отправляет отчёт о смене + обновляет Google Sheets.
         """
         from core.ref_state_repository import RefStateRepository
         from core.telegram_service import TelegramService
+        from core.google_sheets_client import GoogleSheetsClient
         
         point_name = current_session.point_name or "Неизвестная точка"
         administrator = current_session.giver or "Неизвестный"
         session_label = current_session.shift_label or ""
         date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         
-        # === 1. Данные из ПЛАНА НОРМАЛИЗАЦИИ (только DISPOSAL = минусы) ===
+        # === 1. Данные из ПЛАНА НОРМАЛИЗАЦИИ ===
         disposal_operations = []
         if plan and plan.get("operations"):
             disposal_operations = [
-                op for op in plan["operations"] 
+                op for op in plan["operations"]
                 if op.get("type") == "DISPOSAL"
             ]
         
-        # Уникальные виды товаров в минусах (по названию)
         unique_titles = set(op.get("product_title", "") for op in disposal_operations)
         unique_titles.discard("")
         total_types = len(unique_titles)
-        
-        # Общее количество позиций в минусах (сумма quantity)
         total_items = sum(op.get("quantity", 0) for op in disposal_operations)
         
-        # Общая сумма минусов (чистая финансовая ответственность)
-        total_value = financial_summary.get("total_liability_value", 0.0)
+        # === 2. Финансовые показатели из trouble_result ===
+        total_value = 0.0
+        check_value = 0.0
+        pay_value = 0.0
         
-        # === Отладка: что именно попадает в отчёт ===
+        if trouble_result:
+            total_value = trouble_result.get("totalMinus", 0.0) or 0.0
+            check_value = trouble_result.get("disputed", 0.0) or 0.0
+            pay_value = trouble_result.get("toPay", 0.0) or 0.0
+        else:
+            total_value = financial_summary.get("total_liability_value", 0.0)
+        
         print(f"\n[Telegram] 📊 Данные для отчёта:")
-        print(f"    plan существует: {plan is not None}")
         print(f"    DISPOSAL операций: {len(disposal_operations)}")
         for i, op in enumerate(disposal_operations, 1):
             print(f"      [{i}] {op.get('product_title')} × {op.get('quantity')} шт")
         print(f"    ИТОГО: {total_types} видов, {total_items} позиций, {total_value:.2f}₽")
         
-        # === 2. Данные из trouble_result (товары на проверке) ===
+        # === 3. ЕДИНЫЙ ИСТОЧНИК: trouble_operations ===
         all_ref = []
         if trouble_result:
-            # Берём ссылки из trouble_operations — там ВСЕ товары с причинами
             trouble_ops = trouble_result.get("trouble_operations", []) or []
             for op in trouble_ops:
-                ref = op.get("reference", "").strip()
-                if ref:  # только если ссылка указана
+                ref = (op.get("reference") or "").strip()
+                if ref:
                     qty = op.get("quantity", 0)
-                    cost = op.get("cost", 0)
+                    cost = op.get("cost", 0) or 0
+                    title = op.get("product_title") or "Товар"
                     all_ref.append({
-                        "product_title": op.get("product_title") or "Товар",
+                        "product_title": title,
                         "product_id": op.get("product_id"),
                         "reference": ref,
                         "quantity": qty,
-                        "value": cost * qty,  # стоимость этого товара × кол-во
+                        "value": cost * qty,
                         "reason": op.get("reason", ""),
+                        "operation_type": op.get("operation_type", "DISPOSAL"),
+                        "is_excusable": op.get("is_excusable", False),
                     })
-            
-            # Добавляем из allRef (обратная совместимость)
-            existing_ids = {r.get("product_id") for r in all_ref}
-            for ref in trouble_result.get("allRef", []) or []:
-                if ref.get("product_id") not in existing_ids:
-                    all_ref.append(ref)
         
         items_on_check = len(all_ref)
-        
-        # 🆕 Сумма товаров на проверке
-        check_value = sum(r.get("value", 0) for r in all_ref)
-        
-        # 🆕 Итог к возмещению = общий минус - товары на проверке
-        pay_value = max(0.0, total_value - check_value)
-        
-        unique_refs = list(set(
-            r.get("reference") for r in all_ref 
-            if r.get("reference")
-        ))
+        unique_refs = list(set(r.get("reference") for r in all_ref if r.get("reference")))
         links_count = len(unique_refs)
         
-        # Отладка
         print(f"    💰 Финансовая разбивка:")
-        print(f"      Предварительный минус: {total_value:.2f}₽")
-        print(f"      Товары на проверке:    {check_value:.2f}₽ ({items_on_check} шт)")
-        print(f"      К возмещению:          {pay_value:.2f}₽")
+        print(f"      Общий минус:       {total_value:.2f}₽")
+        print(f"      На проверке:       {check_value:.2f}₽ ({items_on_check} шт)")
+        print(f"      К возмещению:      {pay_value:.2f}₽")
+        print(f"    📎 Ссылок: {len(all_ref)}")
+        for i, r in enumerate(all_ref, 1):
+            print(f"      [{i}] {r['product_title']} ({r['quantity']} шт): {r['reference']}")
         
-        # === 3. Сохраняем в БД ===
+        # === 4. Сохраняем в БД ===
         try:
             repo = RefStateRepository()
             general_data = {
@@ -1124,16 +1109,17 @@ class InventoryWindow(QMainWindow):
         except Exception as e:
             print(f"[RefState] ✗ Ошибка БД: {e}")
         
-        # === 4. Текст СТРОГО ПО ШАБЛОНУ ===
+        # === 5. Текст отчёта ===
         lines = [
             f"{date_str} {administrator}",
             f"{total_types} видов, {total_items} позиций, {total_value:.2f}₽",
-            f"Переданные товары на проверку: {items_on_check}",
+            f"Предварительный минус: {total_value:.2f}₽",
+            f"Товары на проверке: {check_value:.2f}₽ ({items_on_check} шт)",
+            f"К возмещению: {pay_value:.2f}₽",
             "",
             "Ссылки:",
         ]
         
-        # Ссылки в формате: • <группа> (<кол-во> шт): <ссылка>
         if all_ref:
             for ref in all_ref:
                 title = ref.get("product_title") or "Товар"
@@ -1145,12 +1131,58 @@ class InventoryWindow(QMainWindow):
         
         message = "\n".join(lines)
         
-        # === 5. Печатаем текст для проверки ===
         print(f"\n[Telegram] 📝 Текст отчёта:\n{'─'*40}")
         print(message)
         print(f"{'─'*40}")
         
-        # === 6. Отправляем в Telegram (с PDF) ===
+        # === 6. 🆕 ОБНОВЛЕНИЕ GOOGLE SHEETS ===
+        if trouble_result and administrator:
+            try:
+                import asyncio
+                sheets_client = GoogleSheetsClient(self.client)
+                
+                # Создаём новый event loop если нет активного
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # В Qt event loop — используем другой подход
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(
+                                asyncio.run,
+                                sheets_client.update_shift(
+                                    administrator=administrator,
+                                    point_name=point_name,
+                                    total_minus=total_value,
+                                    disputed=check_value,
+                                )
+                            )
+                            sheets_result = future.result(timeout=30)
+                    else:
+                        sheets_result = asyncio.run(sheets_client.update_shift(
+                            administrator=administrator,
+                            point_name=point_name,
+                            total_minus=total_value,
+                            disputed=check_value,
+                        ))
+                except RuntimeError:
+                    sheets_result = asyncio.run(sheets_client.update_shift(
+                        administrator=administrator,
+                        point_name=point_name,
+                        total_minus=total_value,
+                        disputed=check_value,
+                    ))
+                
+                if sheets_result.get("success"):
+                    print(f"[GoogleSheets] ✓ {sheets_result.get('message')}")
+                else:
+                    print(f"[GoogleSheets] ⚠ {sheets_result.get('error')}")
+            except Exception as e:
+                print(f"[GoogleSheets] ✗ Ошибка (не критично): {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # === 7. Отправляем в Telegram ===
         try:
             telegram = TelegramService()
             telegram.send_ref_state_report(
@@ -1163,16 +1195,14 @@ class InventoryWindow(QMainWindow):
                 items_on_check=items_on_check,
                 references=unique_refs,
                 pdf_path=pdf_path,
-                # 🆕 новые параметры для финансовой разбивки
                 check_value=check_value,
                 pay_value=pay_value,
-                all_ref=all_ref,  # 🆕 все ссылки с деталями
+                all_ref=all_ref,
             )
         except Exception as e:
             print(f"[Telegram] ✗ Ошибка: {e}")
-    # ============================================================
-    #  🔒 БЕЗОПАСНОЕ ЗАКРЫТИЕ ПЕРЕСЧЁТА
-    # ============================================================
+
+
     def _close_inventory(self):
         self._sync_actuals_from_table()
         
@@ -1282,15 +1312,12 @@ class InventoryWindow(QMainWindow):
             dialog = NormalizationDialog(service, discrepancies, parent=self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 plan = dialog.get_result()
+                print(f"[Inventory] ✓ План нормализации подтверждён: {plan.get('total', 0)} операций")
             else:
-                reply = QMessageBox.question(self, "Отмена нормализации",
-                    "Нормализация отменена. Расхождения НЕ будут обработаны.\nЗакрыть пересчёт без обработки?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply != QMessageBox.StandardButton.Yes: return
-                current_session.is_open = False
-                goods_cache.unsubscribe(self._on_cache_updated)
-                if hasattr(self, '_timer'): self._timer.stop()
-                self.close(); return
+                # ❌ Пользователь отменил план — ВОЗВРАЩАЕМСЯ в окно инвентаризации
+                # НЕ закрываем сессию, НЕ закрываем приложение
+                print("[Inventory] ⚠ План нормализации отменён — возврат в окно инвентаризации")
+                return  # ← КЛЮЧЕВОЕ: просто выходим из метода, окно остаётся открытым
 
             # ШАГ 2: TroubleDialog
             if financial_summary.get("compensation_groups"):
@@ -1311,9 +1338,13 @@ class InventoryWindow(QMainWindow):
                 )
                 if trouble_dialog.exec() == QDialog.DialogCode.Accepted:
                     trouble_result = trouble_dialog.get_result()
-                    print(f"[Inventory] ✓ Причины указаны: к оплате={trouble_result['costTrouble']:.2f}, "
-                        f"на проверке={trouble_result['costDisTrouble']:.2f}")
-                else: print("[Inventory] ⚠ Указание причин пропущено")
+                    print(f"[Inventory] ✓ Причины указаны: к оплате={trouble_result.get('toPay', 0):.2f}, "
+                        f"на проверке={trouble_result.get('disputed', 0):.2f}")
+                else:
+                    # ❌ Пользователь отменил причины — ВОЗВРАЩАЕМСЯ в окно инвентаризации
+                    # НЕ записываем в БД, НЕ применяем нормализацию
+                    print("[Inventory] ⚠ Указание причин отменено — возврат в окно инвентаризации")
+                    return  # ← КЛЮЧЕ
 
             # ШАГ 3: БЛОКИРОВКА + ПРОГРЕСС-ДИАЛОГ
             self._close_locked = True
@@ -1511,8 +1542,9 @@ class InventoryWindow(QMainWindow):
         if plan: print(f"  📋 Запланировано: {plan.get('total', 0)} операций")
         if trouble_result:
             print(f"  💰 ИТОГИ РАСХОЖДЕНИЙ:")
-            print(f"     💳 К оплате:   {trouble_result['costTrouble']:.2f}₽")
-            print(f"     🔍 На проверке: {trouble_result['costDisTrouble']:.2f}₽")
+            print(f"     💰 Общий минус:  {trouble_result.get('totalMinus', 0):.2f}₽")
+            print(f"     🔍 Спорные:      {trouble_result.get('disputed', 0):.2f}₽")
+            print(f"     💳 К оплате:     {trouble_result.get('toPay', 0):.2f}₽")
         print(f"{'='*60}\n")
 
         goods_cache.unsubscribe(self._on_cache_updated)

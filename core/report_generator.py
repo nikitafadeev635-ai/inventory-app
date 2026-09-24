@@ -639,57 +639,43 @@ def generate_normalization_report(discrepancies: list, result: dict,
             ))
 
     # ============================================================
-    #  🆕 v2.1: ФИНАНСОВАЯ РАЗБИВКА + ВСЕ ССЫЛКИ
+    #  💰 ФИНАНСОВАЯ РАЗБИВКА (v2.2 — синхронизация с trouble_dialog)
     # ============================================================
     if trouble_result:
-        # === Собираем ВСЕ ссылки (из trouble_operations + allRef) ===
+        # === ЕДИНЫЙ ИСТОЧНИК: trouble_operations ===
         all_refs_combined = []
-        seen_product_ids = set()
         
-        # 1. Из trouble_operations — там ВСЕ товары с причинами
         trouble_ops = trouble_result.get("trouble_operations", []) or []
         for op in trouble_ops:
             ref = (op.get("reference") or "").strip()
-            if ref:  # только если ссылка указана
-                pid = op.get("product_id")
+            if ref:
                 qty = op.get("quantity", 0)
-                cost = op.get("cost", 0)
+                cost = op.get("cost", 0) or 0
+                title = op.get("product_title") or "Товар"
                 all_refs_combined.append({
-                    "product_title": op.get("product_title") or "Товар",
-                    "group_name": op.get("group_name") or op.get("product_title") or "—",
-                    "product_id": pid,
+                    "product_title": title,
+                    "group_name": op.get("group_name") or title,
+                    "product_id": op.get("product_id"),
                     "reference": ref,
                     "quantity": qty,
                     "value": cost * qty,
                     "reason": op.get("reason") or "",
                 })
-                if pid:
-                    seen_product_ids.add(pid)
         
-        # 2. Добавляем из allRef (для обратной совместимости)
-        all_ref = trouble_result.get("allRef", []) or []
-        for ref in all_ref:
-            pid = ref.get("product_id")
-            if pid not in seen_product_ids and ref.get("reference"):
-                all_refs_combined.append({
-                    "product_title": ref.get("product_title") or ref.get("title") or "Товар",
-                    "group_name": ref.get("group_name") or ref.get("product_title") or "—",
-                    "product_id": pid,
-                    "reference": ref.get("reference") or "",
-                    "quantity": ref.get("quantity", 0),
-                    "value": ref.get("value", 0),
-                    "reason": ref.get("reason") or "",
-                })
+        # === Берём готовые значения из trouble_result ===
+        total_minus = trouble_result.get('totalMinus', 0.0) or 0.0
+        disputed = trouble_result.get('disputed', 0.0) or 0.0
+        to_pay = trouble_result.get('toPay', 0.0) or 0.0
         
-        # === Финансовые показатели ===
-        cost = trouble_result.get('cost', 0.0)            # общий минус
-        cost_trouble = trouble_result.get('costTrouble', 0.0)   # к оплате админом
-        cost_dis_trouble = trouble_result.get('costDisTrouble', 0.0)  # на проверке (из TroubleDialog)
+        # Fallback если новые поля отсутствуют
+        if total_minus == 0.0:
+            total_minus = trouble_result.get('cost', 0.0) or 0.0
+        if disputed == 0.0:
+            disputed = trouble_result.get('costDisTrouble', 0.0) or 0.0
+        if to_pay == 0.0:
+            to_pay = trouble_result.get('costTrouble', 0.0) or 0.0
         
-        # Реальная сумма товаров на проверке (по факту из ссылок)
-        check_value_actual = sum(r.get("value", 0) for r in all_refs_combined)
         check_qty_actual = sum(r.get("quantity", 0) for r in all_refs_combined)
-        pay_value_actual = max(0.0, cost - check_value_actual)
         
         elements.append(Spacer(1, 14))
         elements.append(HRFlowable(width="100%", thickness=1,
@@ -702,8 +688,8 @@ def generate_normalization_report(discrepancies: list, result: dict,
                           fontSize=13)
         ))
         elements.append(Paragraph(
-            "Предварительный минус делится на две части: товары на ручной проверке "
-            "(с предоставленными ссылками) и сумма к немедленному возмещению администратором.",
+            "Общий минус делится на: спорные (уважительная причина + ссылка) "
+            "и к немедленному возмещению.",
             normal_style
         ))
         elements.append(Spacer(1, 8))
@@ -711,9 +697,9 @@ def generate_normalization_report(discrepancies: list, result: dict,
         # === Главная таблица разбивки ===
         summary_table = [
             ["Показатель", "Сумма", "Примечание"],
-            ["Предварительный минус", f"{cost:.2f} ₽", "Общая сумма недостач"],
-            ["🔍 Товары на проверке", f"{check_value_actual:.2f} ₽", f"{check_qty_actual} шт со ссылками"],
-            ["💳 К возмещению", f"{pay_value_actual:.2f} ₽", "Разница (минус - проверка)"],
+            ["💰 Общий минус", f"{total_minus:.2f} ₽", "Все недостачи (DISPOSAL)"],
+            ["🔍 Спорные", f"{disputed:.2f} ₽", f"{check_qty_actual} шт (уважительная + ссылка)"],
+            ["💳 К возмещению", f"{to_pay:.2f} ₽", "Общий минус - Спорные"],
         ]
 
         st = Table(summary_table, colWidths=[200, 120, 160])
@@ -730,13 +716,10 @@ def generate_normalization_report(discrepancies: list, result: dict,
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#334155')),
             ('ROWBACKGROUNDS', (0, 1), (-1, -1),
              [colors.white, colors.HexColor('#FFFBEB')]),
-            # Предварительный минус — серый
             ('BACKGROUND', (0, 1), (-1, 1), colors.HexColor('#F3F4F6')),
             ('TEXTCOLOR', (0, 1), (-1, 1), colors.HexColor('#374151')),
-            # Товары на проверке — жёлтый
             ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#FEF3C7')),
             ('TEXTCOLOR', (0, 2), (-1, 2), colors.HexColor('#92400E')),
-            # К возмещению — красный
             ('BACKGROUND', (0, 3), (-1, 3), colors.HexColor('#FEE2E2')),
             ('TEXTCOLOR', (0, 3), (-1, 3), colors.HexColor('#991B1B')),
             ('TOPPADDING', (0, 0), (-1, -1), 6),
@@ -750,19 +733,20 @@ def generate_normalization_report(discrepancies: list, result: dict,
         if all_refs_combined:
             elements.append(Spacer(1, 12))
             elements.append(Paragraph(
-                f"🔍 Товары на ручной проверке ({len(all_refs_combined)} позиций):",
+                f"🔍 Товары со ссылками ({len(all_refs_combined)} позиций):",
                 ParagraphStyle('RefHeader', parent=header_style,
                               textColor=colors.HexColor('#D97706'))
             ))
 
-            ref_table = [["Товар", "Кол-во", "Сумма", "Ссылка"]]
+            ref_table = [["Товар", "Кол-во", "Сумма", "Причина", "Ссылка"]]
 
             for ref in all_refs_combined:
                 ref_table.append([
-                    (ref.get('product_title') or '—')[:35],
+                    (ref.get('product_title') or '—')[:25],
                     f"{ref.get('quantity', 0)} шт",
                     f"{ref.get('value', 0):.2f} ₽",
-                    (ref.get('reference') or '—')[:50],
+                    (ref.get('reason') or '—')[:20],
+                    (ref.get('reference') or '—')[:35],
                 ])
 
             total_ref_qty = sum(r.get('quantity', 0) for r in all_refs_combined)
@@ -772,9 +756,10 @@ def generate_normalization_report(discrepancies: list, result: dict,
                 f"{total_ref_qty} шт",
                 f"{total_ref_value:.2f} ₽",
                 "",
+                "",
             ])
 
-            rt = Table(ref_table, colWidths=[180, 60, 80, 195])
+            rt = Table(ref_table, colWidths=[130, 50, 70, 110, 155])
             rt.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#D97706')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
@@ -783,7 +768,7 @@ def generate_normalization_report(discrepancies: list, result: dict,
                 ('FONTNAME', (0, -1), (-1, -1), _FONT_BOLD),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
                 ('ALIGN', (1, 0), (2, -1), 'CENTER'),
-                ('ALIGN', (3, 0), (3, -1), 'LEFT'),
+                ('ALIGN', (3, 0), (4, -1), 'LEFT'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                 ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#334155')),
                 ('ROWBACKGROUNDS', (0, 1), (-1, -2),
@@ -801,7 +786,7 @@ def generate_normalization_report(discrepancies: list, result: dict,
         elements.append(Spacer(1, 10))
         elements.append(Paragraph(
             f"💳 <b>ИТОГО К ВОЗМЕЩЕНИЮ АДМИНИСТРАТОРОМ: "
-            f"{pay_value_actual:.2f} ₽</b>",
+            f"{to_pay:.2f} ₽</b>",
             ParagraphStyle('FinalTrouble', parent=normal_style,
                           textColor=colors.HexColor('#DC2626'),
                           fontName=_FONT_BOLD, fontSize=13)
@@ -809,9 +794,9 @@ def generate_normalization_report(discrepancies: list, result: dict,
         
         # Лог для отладки
         print(f"[Report] 💰 Финансовая разбивка PDF:")
-        print(f"    Предварительный минус: {cost:.2f}₽")
-        print(f"    Товары на проверке:    {check_value_actual:.2f}₽ ({check_qty_actual} шт)")
-        print(f"    К возмещению:          {pay_value_actual:.2f}₽")
+        print(f"    Общий минус:     {total_minus:.2f}₽")
+        print(f"    Спорные:         {disputed:.2f}₽ ({check_qty_actual} шт)")
+        print(f"    К возмещению:    {to_pay:.2f}₽")
 
     # ============================================================
     #  ОШИБКИ API
