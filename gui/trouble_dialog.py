@@ -1,6 +1,8 @@
 """
 Диалог Trouble — указание причин расхождений по ГРУППАМ товаров.
 Показывает группы с чистой недостачей (с учётом пересортицы).
+
+v2.0 — Валидация ссылок + базовая причина "Съел" + защита от AttributeError
 """
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QWidget,
@@ -13,12 +15,14 @@ from core.normalization import (REASONS_LESS, REASONS_MORE,
                                  ALL_EXCUSABLE_REASONS)
 from gui.styles import SmartShellColors
 
+# Причины, для которых ссылка ОБЯЗАТЕЛЬНА (без неё нельзя подтвердить)
 REQUIRED_LINK_REASONS = {
     "Не знаю",
     "Товар украден",
     "Не прошла корректно оплата",
     "Просрочка",
 }
+
 
 class TroubleBlock:
     """Один блок разбиения (количество + причина + ссылка)."""
@@ -29,9 +33,7 @@ class TroubleBlock:
 
 
 class TroubleGroup:
-    """
-    Группа товаров с чистой недостачей.
-    """
+    """Группа товаров с чистой недостачей."""
     def __init__(self, group_name: str, net_delta: int, unit_cost: float,
                  total_stock: int, total_actual: int):
         self.group_name = group_name
@@ -90,8 +92,17 @@ class TroubleBlockWidget(QWidget):
         self.reason_combo = QComboBox()
         reasons = REASONS_LESS if self.group.status == "less" else REASONS_MORE
         self.reason_combo.addItems(reasons)
+
+        # 🆕 Базовая причина: "Съел" для минусов
+        if not self.block.reason:
+            if self.group.status == "less" and "Съел" in reasons:
+                self.block.reason = "Съел"
+            elif reasons:
+                self.block.reason = reasons[0]
+
         if self.block.reason in reasons:
             self.reason_combo.setCurrentText(self.block.reason)
+
         self.reason_combo.setMinimumWidth(280)
         self.reason_combo.setStyleSheet(f"""
             QComboBox {{
@@ -138,24 +149,26 @@ class TroubleBlockWidget(QWidget):
         self.remove_btn.clicked.connect(lambda: self._on_remove(self))
         layout.addWidget(self.remove_btn)
 
+        # 🆕 Первоначальная визуальная проверка
+        self._update_reference_visual()
+
     def _on_field_changed(self, *args):
         """Обновляет данные блока и вызывает валидацию."""
         self.block.quantity = self.qty_spin.value()
         self.block.reason = self.reason_combo.currentText()
         self.block.reference = self.ref_edit.text().strip()
-        
+
         # 🆕 Визуальная индикация: красная рамка если обязательная ссылка пустая
         self._update_reference_visual()
-        
-        self._on_changed()
 
+        self._on_changed()
 
     def _update_reference_visual(self):
         """Обновляет визуальное состояние поля ссылки."""
         p = SmartShellColors
         reason = self.block.reason
         reference = self.block.reference.strip()
-        
+
         if reason in REQUIRED_LINK_REASONS and not reference:
             # 🔴 Красная рамка — обязательная ссылка не заполнена
             self.ref_edit.setStyleSheet(f"""
@@ -188,18 +201,17 @@ class TroubleBlockWidget(QWidget):
         """
         reason = self.block.reason
         reference = self.block.reference.strip()
-        
+
         # Проверка 1: Для обязательных причин ссылка НЕОБХОДИМА
         if reason in REQUIRED_LINK_REASONS:
             if not reference:
                 return False, f"Для причины '{reason}' обязательна ссылка"
-        
+
         # Проверка 2: Для уважительных причин (ALL_EXCUSABLE_REASONS) ссылка тоже нужна
-        # (это существующая логика для определения "на проверке" vs "к оплате")
         if reason in ALL_EXCUSABLE_REASONS:
             if not reference:
                 return False, f"Для причины '{reason}' обязательна ссылка"
-        
+
         return True, ""
 
 
@@ -289,7 +301,12 @@ class TroubleGroupWidget(QWidget):
 
     def _add_block(self, block=None):
         if block is None:
-            block = TroubleBlock(quantity=1)
+            # 🆕 Базовая причина "Съел" для минусных групп
+            default_reason = "Съел" if self.group.status == "less" else (
+                REASONS_MORE[0] if REASONS_MORE else ""
+            )
+            block = TroubleBlock(quantity=1, reason=default_reason)
+
         self.group.blocks.append(block)
 
         widget = TroubleBlockWidget(
@@ -401,7 +418,8 @@ class TroubleDialog(QDialog):
         hint = QLabel(
             "Показаны группы с учётом пересортицы (плюсы и минусы внутри бренда компенсируются).\n"
             "Разбейте чистую недостачу на блоки по причинам.\n"
-            "Для причин кроме 'не знаю' требуется подтверждающая ссылка.\n"
+            "Базовая причина для недостач — 'Съел' (ссылка не требуется).\n"
+            "Для причин 'Не знаю', 'Товар украден', 'Не прошла оплата', 'Просрочка' требуется ссылка.\n"
             "Все случаи с ссылками будут проверены вручную."
         )
         hint.setWordWrap(True)
@@ -420,23 +438,23 @@ class TroubleDialog(QDialog):
         """)
         summary_layout = QHBoxLayout(summary_frame)
 
-        self.summary_not_sure = QLabel("💳 К оплате: 0 ₽")
+        self.summary_not_sure = QLabel("💰 Общий минус: 0 ₽")
         self.summary_not_sure.setFont(QFont("Inter", 12, QFont.Weight.Bold))
         self.summary_not_sure.setStyleSheet("color: #ef4444; background: transparent;")
         summary_layout.addWidget(self.summary_not_sure)
 
         summary_layout.addStretch()
 
-        self.summary_excused = QLabel("🔍 На проверке: 0 ₽")
+        self.summary_excused = QLabel("🔍 Спорный: 0 ₽")
         self.summary_excused.setFont(QFont("Inter", 12, QFont.Weight.Bold))
         self.summary_excused.setStyleSheet("color: #f59e0b; background: transparent;")
         summary_layout.addWidget(self.summary_excused)
 
         summary_layout.addStretch()
 
-        self.summary_total = QLabel(f"💰 Итого: {self.total_cost:.2f} ₽")
+        self.summary_total = QLabel("💳 К оплате: 0 ₽")
         self.summary_total.setFont(QFont("Inter", 12, QFont.Weight.Bold))
-        self.summary_total.setStyleSheet("color: #2C87FD; background: transparent;")
+        self.summary_total.setStyleSheet("color: #10b981; background: transparent;")
         summary_layout.addWidget(self.summary_total)
 
         # Скроллируемая область с группами
@@ -483,8 +501,8 @@ class TroubleDialog(QDialog):
         self._update_summary()
 
     def _update_summary(self):
-        not_sure = 0.0
-        excused = 0.0
+        total_minus = 0.0
+        disputed = 0.0
 
         for widget in self._group_widgets:
             for block in widget.group.blocks:
@@ -493,19 +511,20 @@ class TroubleDialog(QDialog):
                     block.reason in ALL_EXCUSABLE_REASONS and
                     bool(block.reference.strip())
                 )
-                if is_excusable:
-                    excused += value
-                else:
-                    not_sure += value
+
+                # 🆕 Все недостачи идут в total_minus
+                if widget.group.status == "less":
+                    total_minus += value
+                    if is_excusable:
+                        disputed += value
+
+        to_pay = total_minus - disputed
 
         if hasattr(self, 'summary_not_sure') and self.summary_not_sure is not None:
-            self.summary_not_sure.setText(f"💳 К оплате: {not_sure:.2f} ₽")
-            self.summary_excused.setText(f"🔍 На проверке: {excused:.2f} ₽")
-            self.summary_total.setText(
-                f"💰 Итого: {self.total_cost:.2f} ₽ "
-                f"(оплата: {not_sure:.2f}, на проверке: {excused:.2f})"
-            )
-        
+            self.summary_not_sure.setText(f"💰 Общий минус: {total_minus:.2f} ₽")
+            self.summary_excused.setText(f"🔍 Спорный: {disputed:.2f} ₽")
+            self.summary_total.setText(f"💳 К оплате: {to_pay:.2f} ₽")
+
         # 🆕 Обновляем состояние кнопки подтверждения
         self._update_confirm_button_state()
 
@@ -517,10 +536,9 @@ class TroubleDialog(QDialog):
         # 🆕 Защита: кнопка может быть ещё не создана при инициализации
         if not hasattr(self, 'confirm_btn') or self.confirm_btn is None:
             return
-        
+
         all_valid = True
-        
-        # Проверяем все блоки во всех группах
+
         for widget in self._group_widgets:
             for bw in widget._block_widgets:
                 valid, _ = bw.is_valid()
@@ -529,10 +547,9 @@ class TroubleDialog(QDialog):
                     break
             if not all_valid:
                 break
-        
-        # Обновляем состояние кнопки
+
         if all_valid:
-            # ✅ Активная кнопка — акцентный цвет
+            # ✅ Активная кнопка
             self.confirm_btn.setEnabled(True)
             self.confirm_btn.setStyleSheet("""
                 QPushButton {
@@ -552,7 +569,7 @@ class TroubleDialog(QDialog):
             """)
             self.confirm_btn.setToolTip("Подтвердить и сохранить причины расхождений")
         else:
-            # ❌ Неактивная кнопка — серый цвет
+            # ❌ Неактивная кнопка
             self.confirm_btn.setEnabled(False)
             self.confirm_btn.setStyleSheet("""
                 QPushButton {
@@ -574,8 +591,16 @@ class TroubleDialog(QDialog):
                 "• Не прошла корректно оплата\n"
                 "• Просрочка"
             )
-            
+
     def _on_confirm(self):
+        """
+        Обработчик нажатия кнопки "Подтвердить и сохранить".
+
+        НОВАЯ ЛОГИКА РАСЧЁТА (v2.0):
+        - totalMinus: общая сумма всех недостач (DISPOSAL)
+        - disputed: сумма на проверке (уважительная причина + ссылка)
+        - toPay: к оплате = totalMinus - disputed
+        """
         # 1. Проверка разбиения
         for widget in self._group_widgets:
             total_qty = sum(b.quantity for b in widget.group.blocks)
@@ -588,7 +613,7 @@ class TroubleDialog(QDialog):
                 )
                 return
 
-        # 2. Проверка валидности блоков (обязательные ссылки заполнены)
+        # 2. Проверка валидности блоков
         for widget in self._group_widgets:
             for bw in widget._block_widgets:
                 valid, msg = bw.is_valid()
@@ -599,9 +624,10 @@ class TroubleDialog(QDialog):
                     )
                     return
 
-        # 3. Формирование результата
-        cost_trouble = 0.0
-        cost_dis_trouble = 0.0
+        # 3. НОВАЯ ЛОГИКА РАСЧЁТА
+        total_minus_value = 0.0      # 💰 ОБЩИЙ минус
+        disputed_value = 0.0         # 🔍 Спорный
+        add_value = 0.0              # 🔵 Избытки
         trouble_operations = []
         all_ref = []
 
@@ -616,19 +642,35 @@ class TroubleDialog(QDialog):
                     bool(block.reference.strip())
                 )
 
-                if is_excusable:
-                    cost_dis_trouble += value
-                    all_ref.append({
-                        "group_name": g.group_name,
-                        "quantity": block.quantity,
-                        "cost": g.unit_cost,
-                        "value": value,
-                        "operation_type": op_type,
-                        "reason": block.reason,
-                        "reference": block.reference,
-                    })
-                else:
-                    cost_trouble += value
+                # Недостача
+                if op_type == "DISPOSAL":
+                    total_minus_value += value
+
+                    if is_excusable:
+                        disputed_value += value
+                        all_ref.append({
+                            "group_name": g.group_name,
+                            "quantity": block.quantity,
+                            "cost": g.unit_cost,
+                            "value": value,
+                            "operation_type": op_type,
+                            "reason": block.reason,
+                            "reference": block.reference,
+                        })
+
+                # Избыток
+                elif op_type == "ADD":
+                    add_value += value
+                    if is_excusable:
+                        all_ref.append({
+                            "group_name": g.group_name,
+                            "quantity": block.quantity,
+                            "cost": g.unit_cost,
+                            "value": value,
+                            "operation_type": op_type,
+                            "reason": block.reason,
+                            "reference": block.reference,
+                        })
 
                 trouble_operations.append({
                     "product_id": 0,
@@ -641,10 +683,12 @@ class TroubleDialog(QDialog):
                     "is_excusable": is_excusable,
                 })
 
-        cost_trouble = round(cost_trouble, 2)
-        cost_dis_trouble = round(cost_dis_trouble, 2)
+        total_minus_value = round(total_minus_value, 2)
+        disputed_value = round(disputed_value, 2)
+        to_pay_value = round(total_minus_value - disputed_value, 2)
+        add_value = round(add_value, 2)
 
-        # Собираем allitemDis из compensation_groups
+        # 4. Сбор allitemDis
         allitem_dis = []
         for g in self.compensation_groups:
             for p in g.get("minus_products", []) + g.get("plus_products", []):
@@ -661,11 +705,19 @@ class TroubleDialog(QDialog):
                         "liability_value": g["liability_value"],
                     })
 
+        # 5. Финальное подтверждение
         msg = (
             f"Итоговый расчёт:\n\n"
-            f"💰 Общая сумма расхождений: {self.total_cost:.2f} ₽\n"
-            f"💳 К оплате администратором: {cost_trouble:.2f} ₽\n"
-            f"🔍 На ручной проверке: {cost_dis_trouble:.2f} ₽\n\n"
+            f"💰 <b>Общий минус:</b> {total_minus_value:.2f} ₽\n"
+            f"🔍 <b>Из них спорных (на проверке):</b> {disputed_value:.2f} ₽\n"
+            f"💳 <b>К оплате администратором:</b> {to_pay_value:.2f} ₽\n"
+        )
+
+        if add_value > 0:
+            msg += f"\n🔵 <b>Избытки (ADD):</b> {add_value:.2f} ₽\n"
+
+        msg += (
+            f"\n📎 Ссылок для проверки: {len(all_ref)}\n\n"
             f"Сохранить и продолжить?"
         )
 
@@ -676,10 +728,20 @@ class TroubleDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # 6. Формирование результата
         self._result = {
+            # Legacy поля (совместимость):
             "cost": self.total_cost,
-            "costTrouble": cost_trouble,
-            "costDisTrouble": cost_dis_trouble,
+            "costTrouble": to_pay_value,
+            "costDisTrouble": disputed_value,
+
+            # Новые поля:
+            "totalMinus": total_minus_value,
+            "disputed": disputed_value,
+            "toPay": to_pay_value,
+            "addValue": add_value,
+
+            # Детализация:
             "trouble_operations": trouble_operations,
             "allRef": all_ref,
             "allitemTrouble": self.all_items,
