@@ -1,6 +1,6 @@
 """
 Локальный веб-сервер для синхронизации с телефонами.
-v7.2 — Адаптация pending-значений + калькулятор.
+v7.3.2 — Каскадное списание по товарам группы.
 
 Принцип работы:
 - На телефоне: два типа данных
@@ -9,10 +9,12 @@ v7.2 — Адаптация pending-значений + калькулятор.
 - При отправке на ПК идут ТОЛЬКО manualItemUpdates
 - На ПК применяется алгоритм распределения ТОЛЬКО на товары без ручного ввода
 
-Новое в v7.2:
-- Адаптация pending-значений при изменении stock (формула: actual_new = actual_old + (stock_new - stock_old))
-- adapted_updates отдаются телефону через /api/groups
-- 🧮 Калькулятор для подсчёта товаров с нескольких полок
+Исправления v7.3.2:
+- 🆕 Каскадное списание по товарам группы (продажа распределяется по всем товарам)
+- 🆕 Дельта группы передаётся на телефон, телефон распределяет каскадно
+- ✅ Факт НИКОГДА не уходит в отрицательные значения
+- ✅ Обновление снапшота при получении данных с телефона (нет двойной корректировки)
+- ✅ Корректная балансировка групп (нет компенсации +1/-1)
 """
 import json
 import threading
@@ -26,13 +28,67 @@ import uvicorn
 
 
 def get_local_ip() -> str:
+    """
+    Определяет локальный IP-адрес, игнорируя прокси/VPN интерфейсы.
+    """
+    import socket
+    import ipaddress
+    
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
+        all_ips = []
+        for interface in socket.if_nameindex():
+            interface_name = interface[1]
+            try:
+                addresses = socket.if_nameindex(interface_name)
+                for info in socket.getaddrinfo(socket.gethostname(), None):
+                    ip = info[4][0]
+                    if ip and not ip.startswith('127.'):
+                        all_ips.append(ip)
+            except:
+                pass
+        
+        if not all_ips:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                ip = info[4][0]
+                if ip and not ip.startswith('127.'):
+                    all_ips.append(ip)
+        
+        if not all_ips:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            fallback_ip = s.getsockname()[0]
+            s.close()
+            all_ips = [fallback_ip]
+        
+        private_ips = []
+        for ip in set(all_ips):
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+                if ip_obj.is_private and not ip_obj.is_loopback:
+                    if ip.startswith('172.'):
+                        second_octet = int(ip.split('.')[1])
+                        if second_octet >= 19:
+                            continue
+                    private_ips.append(ip)
+            except:
+                continue
+        
+        if not private_ips:
+            return all_ips[0] if all_ips else "127.0.0.1"
+        
+        for ip in private_ips:
+            if ip.startswith('192.168.'):
+                return ip
+        
+        for ip in private_ips:
+            if ip.startswith('10.'):
+                return ip
+        
+        return private_ips[0]
+        
+    except Exception as e:
+        print(f"[SyncServer] ⚠ Ошибка определения IP: {e}")
         return "127.0.0.1"
 
 
@@ -54,8 +110,8 @@ class SyncServer:
         self._group_updates: Dict[str, int] = {}
         self._item_updates: Dict[int, int] = {}
         self._single_updates: Dict[int, int] = {}
-        # 🆕 Адаптированные значения для телефона
         self._adapted_updates: dict = {"item_updates": {}, "single_updates": {}, "group_updates": {}}
+        self._stock_snapshot: Dict[int, int] = {}
         self._callbacks = []
         self._version: int = 0
         self._setup_routes()
@@ -78,6 +134,7 @@ class SyncServer:
                 "pending_count": (len(self._group_updates) +
                                   len(self._item_updates) +
                                   len(self._single_updates)),
+                "registered_items": len(self._stock_snapshot),
                 "version": self._version,
                 "local_ip": get_local_ip(),
                 "port": self.port,
@@ -112,7 +169,6 @@ class SyncServer:
                 "groups_count": len(groups_list),
                 "singles_count": len(singles_list),
                 "version": self._version,
-                # 🆕 Адаптированные значения для телефона
                 "adapted_updates": self._adapted_updates,
             }
 
@@ -134,24 +190,59 @@ class SyncServer:
                 print(f"[SyncServer] 📋 ТОЧНЫЕ ручные факты (manual):")
                 for pid, actual in item_updates_in.items():
                     print(f"    pid={pid} → actual={actual}")
+
+            # Группы
             for group_name, total_actual in group_updates_in.items():
                 if group_name in self._groups:
                     try:
                         self._group_updates[group_name] = int(total_actual)
                     except (ValueError, TypeError):
                         pass
+
+            # 🆕 Точные ручные факты с ОБНОВЛЕНИЕМ СНАПШОТА
             for pid_str, actual in item_updates_in.items():
                 try:
-                    self._item_updates[int(pid_str)] = int(actual)
+                    pid = int(pid_str)
+                    actual_value = max(0, int(actual))
+                    self._item_updates[pid] = actual_value
+
+                    current_stock = None
+                    for g in self._groups.values():
+                        for p in g["products"]:
+                            if p["id"] == pid:
+                                current_stock = p["stock"]
+                                break
+                        if current_stock is not None:
+                            break
+                    if current_stock is None and pid in self._singles:
+                        current_stock = self._singles[pid]["stock"]
+
+                    if current_stock is not None:
+                        old_snapshot = self._stock_snapshot.get(pid)
+                        self._stock_snapshot[pid] = current_stock
+                        if old_snapshot is not None and old_snapshot != current_stock:
+                            print(f"[SyncServer] 📸 Снапшот #{pid}: {old_snapshot} → {current_stock}")
+
                 except (ValueError, TypeError):
                     pass
+
+            # 🆕 Одиночные товары с ОБНОВЛЕНИЕМ СНАПШОТА
             for pid_str, actual in single_updates_in.items():
                 try:
                     pid = int(pid_str)
                     if pid in self._singles:
-                        self._single_updates[pid] = int(actual)
+                        actual_value = max(0, int(actual))
+                        self._single_updates[pid] = actual_value
+
+                        old_snapshot = self._stock_snapshot.get(pid)
+                        current_stock = self._singles[pid]["stock"]
+                        self._stock_snapshot[pid] = current_stock
+                        if old_snapshot is not None and old_snapshot != current_stock:
+                            print(f"[SyncServer] 📸 Снапшот одиночного #{pid}: {old_snapshot} → {current_stock}")
+
                 except (ValueError, TypeError):
                     pass
+
             for callback in self._callbacks:
                 try:
                     callback({
@@ -161,6 +252,7 @@ class SyncServer:
                     })
                 except Exception as e:
                     print(f"[SyncServer] Callback error: {e}")
+
             return {
                 "success": True,
                 "pending_groups": len(self._group_updates),
@@ -209,9 +301,44 @@ class SyncServer:
             self._single_updates.clear()
             return {"success": True}
 
+        @self.app.post("/api/register_item")
+        async def register_item(request: Request):
+            """
+            Регистрирует товар при первом вводе значения.
+            Сохраняет снимок остатка SmartShell на момент ввода.
+            """
+            try:
+                data = await request.json()
+            except Exception as e:
+                return {"success": False, "error": f"Invalid JSON: {e}"}
+
+            product_id = data.get("product_id")
+            stock_at_input = data.get("stock")
+
+            if product_id is None or stock_at_input is None:
+                return {"success": False, "error": "product_id and stock required"}
+
+            try:
+                product_id = int(product_id)
+                stock_at_input = int(stock_at_input)
+            except (ValueError, TypeError):
+                return {"success": False, "error": "invalid types"}
+
+            if product_id not in self._stock_snapshot:
+                self._stock_snapshot[product_id] = stock_at_input
+                print(f"[SyncServer] ✓ Зарегистрирован товар {product_id}, снимок: {stock_at_input}")
+            else:
+                print(f"[SyncServer] ⚠ Товар {product_id} уже зарегистрирован (снимок: {self._stock_snapshot[product_id]})")
+
+            return {
+                "success": True,
+                "product_id": product_id,
+                "snapshot": self._stock_snapshot[product_id],
+            }
+
         @self.app.get("/", response_class=HTMLResponse)
         async def index():
-            print("[SyncServer] GET / — отдаю HTML (v7.2 + калькулятор + адаптация)")
+            print("[SyncServer] GET / — отдаю HTML (v7.3.2 каскадное списание)")
             html = self._get_mobile_html()
             return HTMLResponse(content=html, headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
@@ -227,6 +354,7 @@ class SyncServer:
         self._item_updates.clear()
         self._single_updates.clear()
         self._adapted_updates = {"item_updates": {}, "single_updates": {}, "group_updates": {}}
+        self._stock_snapshot = {}
         self._version = 1
         for g in groups_data:
             self._groups[g["name"]] = {"name": g["name"], "total_stock": g["total_stock"], "products": g["products"]}
@@ -236,16 +364,17 @@ class SyncServer:
 
     def update_data(self, groups_data: list, singles_data: list):
         """
-        🆕 v7.2: Обновляет данные с АДАПТАЦИЕЙ pending-значений.
-        Если stock изменился (продажа/внесение в SmartShell) —
-        корректируем pending значения по формуле:
-            actual_new = actual_old + (stock_new - stock_old)
-        Адаптированные значения передаются телефону через adapted_updates.
+        v7.3.2: Обновляет данные с АДАПТАЦИЕЙ.
+        
+        Логика:
+        - Адаптация срабатывает для товаров в pending (через item_updates)
+        - Для ГРУПП передаётся дельта общего остатка (group_stock_changes)
+        - Телефон распределяет дельту каскадно по товарам группы
+        - 🚨 Факт НИКОГДА не может быть меньше 0
         """
         if not self._session_id:
             return
 
-        # Запоминаем СТАРЫЕ stock для адаптации
         old_stocks = {}
         for g in self._groups.values():
             old_stocks[f"group_{g['name']}"] = g["total_stock"]
@@ -254,15 +383,12 @@ class SyncServer:
         for s in self._singles.values():
             old_stocks[f"single_{s['id']}"] = s["stock"]
 
-        # Сохраняем старые pending для переноса
         old_group_updates = dict(self._group_updates)
         old_item_updates = dict(self._item_updates)
         old_single_updates = dict(self._single_updates)
 
-        # 🆕 Очищаем адаптированные значения (будут заполнены заново)
         self._adapted_updates = {"item_updates": {}, "single_updates": {}, "group_updates": {}}
 
-        # Обновляем структуры
         self._groups = {}
         for g in groups_data:
             self._groups[g["name"]] = {"name": g["name"], "total_stock": g["total_stock"], "products": g["products"]}
@@ -270,12 +396,13 @@ class SyncServer:
         for s in singles_data:
             self._singles[s["id"]] = {"id": s["id"], "title": s["title"], "stock": s["stock"]}
 
-        # 🆕 АДАПТАЦИЯ pending-значений
         adapted_groups = 0
         adapted_items = 0
         adapted_singles = 0
 
-        # Группы
+        # ============================================================
+        # 1. ГРУППЫ в pending (с ограничением max(0, ...))
+        # ============================================================
         self._group_updates = {}
         for group_name, actual in old_group_updates.items():
             if group_name in self._groups:
@@ -283,12 +410,14 @@ class SyncServer:
                 new_total = self._groups[group_name]["total_stock"]
                 if old_total is not None and old_total != new_total:
                     stock_delta = new_total - old_total
-                    actual = actual + stock_delta
+                    actual = max(0, actual + stock_delta)
                     self._adapted_updates["group_updates"][group_name] = actual
                     adapted_groups += 1
                 self._group_updates[group_name] = actual
 
-        # Точные ручные факты по товарам
+        # ============================================================
+        # 2. ТОЧНЫЕ РУЧНЫЕ ФАКТЫ в pending (с ограничением max(0, ...))
+        # ============================================================
         self._item_updates = {}
         for pid, actual in old_item_updates.items():
             found = False
@@ -299,16 +428,25 @@ class SyncServer:
                         new_stock = p["stock"]
                         if old_stock is not None and old_stock != new_stock:
                             stock_delta = new_stock - old_stock
-                            actual = actual + stock_delta
+                            actual = max(0, actual + stock_delta)
                             self._adapted_updates["item_updates"][str(pid)] = actual
                             adapted_items += 1
+                            
+                            if pid in self._stock_snapshot:
+                                self._stock_snapshot[pid] = new_stock
+                        
                         self._item_updates[pid] = actual
                         found = True
                         break
                 if found:
                     break
+            
+            if not found:
+                self._item_updates[pid] = max(0, actual)
 
-        # Одиночные товары
+        # ============================================================
+        # 3. ОДИНОЧНЫЕ ТОВАРЫ в pending (с ограничением max(0, ...))
+        # ============================================================
         self._single_updates = {}
         for pid, actual in old_single_updates.items():
             if pid in self._singles:
@@ -316,27 +454,59 @@ class SyncServer:
                 new_stock = self._singles[pid]["stock"]
                 if old_stock is not None and old_stock != new_stock:
                     stock_delta = new_stock - old_stock
-                    actual = actual + stock_delta
+                    actual = max(0, actual + stock_delta)
                     self._adapted_updates["single_updates"][str(pid)] = actual
                     adapted_singles += 1
+                    
+                    if pid in self._stock_snapshot:
+                        self._stock_snapshot[pid] = new_stock
+                
                 self._single_updates[pid] = actual
+            else:
+                self._single_updates[pid] = max(0, actual)
+
+        # ============================================================
+        # 4. 🆕 КАСКАДНОЕ СПИСАНИЕ ДЛЯ ГРУПП
+        # Передаём дельту ОБЩЕГО остатка группы, телефон распределит каскадно
+        # ============================================================
+        group_stock_changes = {}
+        
+        for group_name, group_data in self._groups.items():
+            old_total = old_stocks.get(f"group_{group_name}")
+            new_total = group_data["total_stock"]
+            
+            if old_total is not None and old_total != new_total:
+                delta = new_total - old_total
+                
+                # Проверяем есть ли зарегистрированные товары в этой группе
+                has_registered = False
+                for p in group_data["products"]:
+                    if p["id"] in self._stock_snapshot:
+                        has_registered = True
+                        break
+                
+                if has_registered:
+                    group_stock_changes[group_name] = delta
+                    print(f"[SyncServer] 📱 Группа '{group_name}': stock {old_total} → {new_total} (Δ{delta:+d})")
+                    
+                    # Обновляем снапшоты всех товаров группы
+                    for p in group_data["products"]:
+                        pid = p["id"]
+                        if pid in self._stock_snapshot:
+                            self._stock_snapshot[pid] = p["stock"]
+        
+        if group_stock_changes:
+            self._adapted_updates["group_stock_changes"] = group_stock_changes
+            print(f"[SyncServer] 📱 Передано {len(group_stock_changes)} изменений групп на телефон")
 
         self._version += 1
         kept_items = len(self._item_updates)
 
-        # Логирование адаптаций
         if adapted_groups > 0 or adapted_items > 0 or adapted_singles > 0:
-            print(f"[SyncServer] 🔄 АДАПТАЦИЯ по изменению stock:")
-            if adapted_groups > 0:
-                print(f"    Групп: {adapted_groups}")
-            if adapted_items > 0:
-                print(f"    Точных вкусов: {adapted_items}")
-            if adapted_singles > 0:
-                print(f"    Одиночных: {adapted_singles}")
+            print(f"[SyncServer] 🔄 АДАПТАЦИЯ: {adapted_groups} групп, {adapted_items} вкусов, {adapted_singles} одиночных")
 
         print(f"[SyncServer] ✓ Обновление: {len(groups_data)} групп, {len(singles_data)} одиночных, "
-              f"сохранено {len(self._group_updates)}+{kept_items}+{len(self._single_updates)} pending, "
-              f"адаптировано {adapted_groups}+{adapted_items}+{adapted_singles}, версия={self._version}")
+              f"pending: {len(self._group_updates)}+{kept_items}+{len(self._single_updates)}, версия={self._version}")
 
     def stop_session(self):
         self._session_id = None
@@ -346,6 +516,7 @@ class SyncServer:
         self._item_updates.clear()
         self._single_updates.clear()
         self._adapted_updates = {"item_updates": {}, "single_updates": {}, "group_updates": {}}
+        self._stock_snapshot = {}
         self._version = 0
         print("[SyncServer] Сессия остановлена")
 
@@ -373,14 +544,112 @@ class SyncServer:
         return result
 
     def apply_pending(self, callback):
+        """
+        v7.3.2: Применяет pending обновления с корректировкой.
+        🚨 Факт НИКОГДА не может быть меньше 0.
+        """
+        def adjust_fact(product_id: int, fact: int, current_stock: int) -> tuple:
+            snapshot_stock = self._stock_snapshot.get(product_id)
+            
+            if snapshot_stock is None:
+                return max(0, fact), 0
+            
+            stock_change = current_stock - snapshot_stock
+            
+            if stock_change < 0:
+                corrected_fact = max(0, fact + stock_change)
+                return corrected_fact, stock_change
+            elif stock_change > 0:
+                corrected_fact = fact + stock_change
+                return corrected_fact, stock_change
+            else:
+                return max(0, fact), 0
+        
+        corrected_item_updates = {}
+        sold_during = {}
+        added_during = {}
+        
+        for pid, actual in self._item_updates.items():
+            current_stock = 0
+            found = False
+            
+            for g in self._groups.values():
+                for p in g.get("products", []):
+                    if p["id"] == pid:
+                        current_stock = p["stock"]
+                        found = True
+                        break
+                if found:
+                    break
+            
+            if not found:
+                if pid in self._singles:
+                    current_stock = self._singles[pid].get("stock", 0)
+            
+            corrected, change = adjust_fact(pid, actual, current_stock)
+            corrected_item_updates[pid] = corrected
+            
+            if change < 0:
+                sold_during[pid] = abs(change)
+                print(f"[SyncServer] 📉 Товар {pid}: продано {abs(change)}, факт {actual} → {corrected}")
+            elif change > 0:
+                added_during[pid] = change
+                print(f"[SyncServer] 📈 Товар {pid}: внесено {change}, факт {actual} → {corrected}")
+        
+        corrected_single_updates = {}
+        for pid, actual in self._single_updates.items():
+            current_stock = self._singles.get(pid, {}).get("stock", 0)
+            corrected, change = adjust_fact(pid, actual, current_stock)
+            corrected_single_updates[pid] = corrected
+            
+            if change < 0:
+                sold_during[pid] = abs(change)
+                print(f"[SyncServer] 📉 Одиночный {pid}: продано {abs(change)}, факт {actual} → {corrected}")
+            elif change > 0:
+                added_during[pid] = change
+                print(f"[SyncServer] 📈 Одиночный {pid}: внесено {change}, факт {actual} → {corrected}")
+        
+        corrected_group_updates = {}
+        for group_name, total_actual in self._group_updates.items():
+            group_data = self._groups.get(group_name, {})
+            products = group_data.get("products", [])
+            
+            group_total_change = 0
+            for p in products:
+                pid = p["id"]
+                snapshot = self._stock_snapshot.get(pid)
+                if snapshot is not None:
+                    current = p["stock"]
+                    group_total_change += (current - snapshot)
+            
+            corrected_total = max(0, total_actual + group_total_change)
+            corrected_group_updates[group_name] = corrected_total
+            
+            if group_total_change != 0:
+                print(f"[SyncServer] 📊 Группа '{group_name}': факт {total_actual} → {corrected_total} (Δ{group_total_change:+d})")
+        
         updates = {
-            "group_updates": dict(self._group_updates),
-            "item_updates": dict(self._item_updates),
-            "single_updates": dict(self._single_updates),
+            "group_updates": corrected_group_updates,
+            "item_updates": corrected_item_updates,
+            "single_updates": corrected_single_updates,
+            "sold_during_count": sold_during,
+            "added_during_count": added_during,
         }
+        
+        if sold_during or added_during:
+            total_sold = sum(sold_during.values())
+            total_added = sum(added_during.values())
+            print(f"[SyncServer] 📊 Итог корректировки:")
+            if total_sold > 0:
+                print(f"    📉 Продано во время пересчёта: {len(sold_during)} товаров, {total_sold} шт")
+            if total_added > 0:
+                print(f"    📈 Внесено во время пересчёта: {len(added_during)} товаров, {total_added} шт")
+        
         self._group_updates.clear()
         self._item_updates.clear()
         self._single_updates.clear()
+        self._stock_snapshot.clear()
+        
         return updates
 
     def on_pending_update(self, callback):
@@ -437,7 +706,7 @@ class SyncServer:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QFact v7.2</title>
+<title>QFact v7.3.2</title>
 <style>
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; background: #0D1217; }
@@ -570,7 +839,7 @@ body { color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 
 <body>
 <div class="sticky-header">
     <h1>
-        <span>📦 QFact v7.2</span>
+        <span>📦 QFact v7.3.2</span>
         <button id="logToggle" onclick="toggleLog()">📋 Лог</button>
     </h1>
     <div class="status-line">
@@ -629,7 +898,8 @@ var itemUpdates = {}, manualItemUpdates = {}, singleUpdates = {};
 var expandedGroups = {}, currentVersion = 0, refreshInterval = null, currentSearch = '';
 var logVisible = false;
 
-// 🧮 Калькулятор
+var registeredItems = new Set();
+
 var activeInput = null;
 var calcValue = '0', calcCurrentOp = null, calcPrevious = null, calcNewNumber = true, calcExpression = '';
 
@@ -646,6 +916,29 @@ function addLog(msg, type) {
     line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
     el.appendChild(line); el.scrollTop = el.scrollHeight;
     console.log('[QFact][' + (type || 'info') + '] ' + msg);
+}
+
+function registerItemIfNeeded(productId, stock) {
+    if (registeredItems.has(productId)) return;
+    
+    fetch('/api/register_item', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            product_id: productId,
+            stock: stock
+        })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (d.success) {
+            registeredItems.add(productId);
+            addLog('✓ Зарегистрирован #' + productId + ' (снимок: ' + d.snapshot + ')', 'info');
+        }
+    })
+    .catch(function(e) {
+        console.error('Register item error:', e);
+    });
 }
 
 function findGroup(name) {
@@ -677,47 +970,150 @@ function getGroupTotal(group) {
 }
 
 function distribute(total, products) {
+    if (total < 0) total = 0;
+    
     var totalStock = 0;
     for (var i = 0; i < products.length; i++) totalStock += products[i].stock;
+    
     if (totalStock === 0) {
         var perItem = Math.floor(total / products.length), result = [];
-        for (var i = 0; i < products.length; i++) result.push(perItem);
+        for (var i = 0; i < products.length; i++) result.push(Math.max(0, perItem));
         var leftover = total - perItem * products.length;
         for (var j = 0; j < leftover && j < result.length; j++) result[j]++;
         return result;
     }
-    var delta = total - totalStock, exact = [], floored = [];
-    for (var i = 0; i < products.length; i++) {
-        var e = delta * (products[i].stock / totalStock);
-        exact.push(e); floored.push(Math.floor(e));
+    
+    var delta = total - totalStock;
+    
+    if (delta === 0) {
+        var result = [];
+        for (var i = 0; i < products.length; i++) result.push(products[i].stock);
+        return result;
     }
-    var sum = 0;
-    for (var i = 0; i < floored.length; i++) sum += floored[i];
-    var leftover = delta - sum, remainders = [];
-    for (var i = 0; i < exact.length; i++) remainders.push({r: exact[i] - floored[i], i: i});
-    remainders.sort(function(a, b) { return b.r - a.r; });
-    for (var j = 0; j < leftover; j++) floored[remainders[j % remainders.length].i] += 1;
+    
     var result = [];
-    for (var i = 0; i < products.length; i++) result.push(products[i].stock + floored[i]);
+    for (var i = 0; i < products.length; i++) result.push(products[i].stock);
+    
+    if (delta > 0) {
+        var remaining = delta;
+        var idx = 0;
+        while (remaining > 0) {
+            result[idx % result.length]++;
+            remaining--;
+            idx++;
+        }
+    } else {
+        var remaining = Math.abs(delta);
+        var idx = result.length - 1;
+        var maxAttempts = remaining * result.length + result.length;
+        var attempts = 0;
+        while (remaining > 0 && attempts < maxAttempts) {
+            if (result[idx] > 0) {
+                result[idx]--;
+                remaining--;
+            }
+            idx--;
+            if (idx < 0) idx = result.length - 1;
+            attempts++;
+        }
+    }
+    
+    for (var i = 0; i < result.length; i++) {
+        if (result[i] < 0) result[i] = 0;
+    }
+    
     return result;
 }
 
 function safeId(name) { return name.replace(/[^a-zA-Zа-яА-Я0-9]/g, '_'); }
 
-// 🆕 Адаптация значений при обновлении версии (продажа/внесение)
+// 🚨 v7.3.2: КАСКАДНОЕ списание по товарам группы
 function applyAdaptedUpdates(adapted) {
     if (!adapted) return;
     var count = 0;
-    addLog('🔄 applyAdaptedUpdates called', 'info');
+    
+    // 🆕 ОБРАБОТКА ИЗМЕНЕНИЙ ГРУПП (каскадное списание)
+    if (adapted.group_stock_changes) {
+        for (var groupName in adapted.group_stock_changes) {
+            var delta = adapted.group_stock_changes[groupName];
+            var group = findGroup(groupName);
+            if (!group) continue;
+            
+            if (delta < 0) {
+                // ПРОДАЖА: каскадное списание по товарам группы
+                var remaining = Math.abs(delta);
+                
+                for (var i = 0; i < group.products.length && remaining > 0; i++) {
+                    var pid = group.products[i].id;
+                    
+                    if (itemUpdates[pid] !== undefined && itemUpdates[pid] > 0) {
+                        var canTake = Math.min(itemUpdates[pid], remaining);
+                        var oldValue = itemUpdates[pid];
+                        itemUpdates[pid] = oldValue - canTake;
+                        
+                        if (manualItemUpdates[pid] !== undefined) {
+                            manualItemUpdates[pid] = itemUpdates[pid];
+                        }
+                        
+                        addLog('📱 ' + group.products[i].title + ': факт ' + oldValue + ' → ' + itemUpdates[pid] + ' (списано ' + canTake + ')', 'warn');
+                        remaining -= canTake;
+                        count++;
+                    }
+                }
+                
+                if (remaining > 0) {
+                    addLog('⚠ Группа ' + groupName + ': не хватило факта для списания ' + remaining + ' шт', 'err');
+                }
+                
+            } else if (delta > 0) {
+                // ПОСТУПЛЕНИЕ: добавляем к первому товару группы
+                var remaining = delta;
+                
+                for (var i = 0; i < group.products.length && remaining > 0; i++) {
+                    var pid = group.products[i].id;
+                    
+                    if (itemUpdates[pid] !== undefined) {
+                        var oldValue = itemUpdates[pid];
+                        itemUpdates[pid] = oldValue + remaining;
+                        
+                        if (manualItemUpdates[pid] !== undefined) {
+                            manualItemUpdates[pid] = itemUpdates[pid];
+                        }
+                        
+                        addLog('📱 ' + group.products[i].title + ': факт ' + oldValue + ' → ' + itemUpdates[pid] + ' (добавлено ' + remaining + ')', 'warn');
+                        remaining = 0;
+                        count++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Обработка одиночных товаров
+    if (adapted.stock_changes) {
+        for (var pidStr in adapted.stock_changes) {
+            var pid = parseInt(pidStr);
+            var delta = adapted.stock_changes[pidStr];
+            
+            if (singleUpdates[pid] !== undefined) {
+                var oldValue = singleUpdates[pid];
+                var newValue = Math.max(0, oldValue + delta);
+                singleUpdates[pid] = newValue;
+                if (newValue !== oldValue) {
+                    addLog('📱 Одиночный #' + pid + ': факт ' + oldValue + ' → ' + newValue + ' (Δ' + (delta > 0 ? '+' : '') + delta + ')', 'warn');
+                    count++;
+                }
+            }
+        }
+    }
+    
+    // Обработка для товаров в pending
     if (adapted.item_updates) {
-        addLog('  item_updates keys: ' + Object.keys(adapted.item_updates).join(', '), 'info');
         for (var pid in adapted.item_updates) {
             var pidInt = parseInt(pid);
-            var newValue = parseInt(adapted.item_updates[pid]);
-            addLog('  Processing pid=' + pidInt + ', new value=' + newValue, 'info');
+            var newValue = Math.max(0, parseInt(adapted.item_updates[pid]));
             if (itemUpdates[pidInt] !== undefined || itemUpdates[pid] !== undefined) {
-                var oldValue = itemUpdates[pidInt] !== undefined ? itemUpdates[pidInt] : itemUpdates[pid];
-                addLog('    Old value: ' + oldValue + ', New value: ' + newValue, 'info');
                 itemUpdates[pidInt] = newValue;
                 itemUpdates[pid] = newValue;
                 if (manualItemUpdates[pidInt] !== undefined || manualItemUpdates[pid] !== undefined) {
@@ -725,15 +1121,13 @@ function applyAdaptedUpdates(adapted) {
                     manualItemUpdates[pid] = newValue;
                 }
                 count++;
-            } else {
-                addLog('    pid=' + pidInt + ' not found in itemUpdates', 'warn');
             }
         }
     }
     if (adapted.single_updates) {
         for (var pid in adapted.single_updates) {
             var pidInt = parseInt(pid);
-            var newValue = parseInt(adapted.single_updates[pid]);
+            var newValue = Math.max(0, parseInt(adapted.single_updates[pid]));
             if (singleUpdates[pidInt] !== undefined || singleUpdates[pid] !== undefined) {
                 singleUpdates[pidInt] = newValue;
                 singleUpdates[pid] = newValue;
@@ -741,8 +1135,10 @@ function applyAdaptedUpdates(adapted) {
             }
         }
     }
+    
     if (count > 0) {
-        addLog('🔄 Адаптировано значений при продаже/внесении: ' + count, 'warn');
+        addLog('🔄 Адаптировано значений: ' + count, 'warn');
+        render();
     }
 }
 
@@ -878,7 +1274,6 @@ function attachInputHandlers() {
     }
 }
 
-// 🧮 Функции калькулятора
 function setActiveInput(input) {
     if (activeInput && activeInput !== input) activeInput.classList.remove('active-field');
     activeInput = input;
@@ -999,8 +1394,7 @@ function calcApply() {
     if (!activeInput) { alert('⚠ Нет активного поля'); return; }
     var result = parseFloat(calcValue);
     if (isNaN(result)) { alert('⚠ Некорректное значение'); return; }
-    var rounded = Math.round(result);
-    if (rounded < 0) rounded = 0;
+    var rounded = Math.max(0, Math.round(result));
     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
     nativeInputValueSetter.call(activeInput, rounded.toString());
     activeInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1068,26 +1462,23 @@ function onItemInput(pid, value, groupName, inputElement) {
     } else {
         var num = parseInt(value);
         if (!isNaN(num)) {
+            if (num < 0) num = 0;
+            
             itemUpdates[pid] = num; manualItemUpdates[pid] = num;
             applyItemStyles(inputElement, num, findGroup(groupName));
             
-            // 🆕 АВТОЗАПОЛНЕНИЕ СИБЛИНГОВ В ГРУППЕ
             var group = findGroup(groupName);
             if (group && group.products) {
                 var autoFilled = 0;
                 for (var i = 0; i < group.products.length; i++) {
                     var p = group.products[i];
-                    // Пропускаем сам редактируемый товар
                     if (p.id === pid) continue;
-                    // Пропускаем уже заполненные товары
                     if (itemUpdates[p.id] !== undefined) continue;
                     
-                    // Автозаполнение: actual = stock (сходится)
                     itemUpdates[p.id] = p.stock;
                     manualItemUpdates[p.id] = p.stock;
                     autoFilled++;
                     
-                    // Обновляем UI для этого сиблинга
                     var siblingInput = document.querySelector(
                         '.item-input[data-pid="' + p.id + '"]'
                     );
@@ -1098,13 +1489,17 @@ function onItemInput(pid, value, groupName, inputElement) {
                 }
                 if (autoFilled > 0) {
                     addLog('✓ Автозаполнено ' + autoFilled + ' сиблингов в группе ' + groupName, 'ok');
-                    // Автоматически разворачиваем группу чтобы увидеть результат
                     var sid = safeId(groupName);
                     if (!expandedGroups[sid]) {
                         expandedGroups[sid] = true;
                         var container = document.getElementById('items_' + sid);
                         if (container) container.classList.add('open');
                     }
+                }
+                
+                for (var i = 0; i < group.products.length; i++) {
+                    var p = group.products[i];
+                    registerItemIfNeeded(p.id, p.stock);
                 }
             }
         }
@@ -1113,10 +1508,27 @@ function onItemInput(pid, value, groupName, inputElement) {
 }
 
 function onSingleInput(pid, value, inputElement) {
-    if (value === '' || value === null) delete singleUpdates[pid];
-    else { var num = parseInt(value); if (!isNaN(num)) singleUpdates[pid] = num; }
-    if (value !== '' && value !== null) applySingleStyles(inputElement, parseInt(value), findSingle(pid));
-    else { inputElement.className = 'item-input'; if (activeInput === inputElement) inputElement.classList.add('active-field'); }
+    if (value === '' || value === null) {
+        delete singleUpdates[pid];
+    } else { 
+        var num = parseInt(value); 
+        if (!isNaN(num)) {
+            if (num < 0) num = 0;
+            
+            singleUpdates[pid] = num;
+            
+            var single = findSingle(pid);
+            if (single) {
+                registerItemIfNeeded(pid, single.stock);
+            }
+        }
+    }
+    if (value !== '' && value !== null) {
+        applySingleStyles(inputElement, parseInt(value), findSingle(pid));
+    } else { 
+        inputElement.className = 'item-input'; 
+        if (activeInput === inputElement) inputElement.classList.add('active-field'); 
+    }
     updateSyncButton();
 }
 
@@ -1129,10 +1541,18 @@ function onGroupInput(groupName, value, inputElement) {
         }
     } else {
         var total = parseInt(value); if (isNaN(total)) return;
+        
+        if (total < 0) total = 0;
+        
         var distributed = distribute(total, group.products);
         for (var i = 0; i < group.products.length; i++) {
             var pid = group.products[i].id;
             itemUpdates[pid] = distributed[i]; delete manualItemUpdates[pid];
+        }
+        
+        for (var i = 0; i < group.products.length; i++) {
+            var p = group.products[i];
+            registerItemIfNeeded(p.id, p.stock);
         }
     }
     updateGroupItemsValues(groupName); updateGroupDisplay(groupName); updateSyncButton();
@@ -1210,7 +1630,6 @@ function updateSyncButton() {
 
 function syncData() {
     var itemUpdatesToSend = {};
-    // 🆕 Отправляем ВСЕ заполненные товары (включая автозаполненные)
     for (var pid in itemUpdates) {
         itemUpdatesToSend[pid] = itemUpdates[pid];
     }
@@ -1234,6 +1653,7 @@ function syncData() {
     addLog('  Групп: ' + Object.keys(groupUpdates).length, 'info');
     addLog('  Товаров (все): ' + Object.keys(itemUpdatesToSend).length, 'info');
     addLog('  Одиночных: ' + Object.keys(singleUpdatesToSend).length, 'info');
+    addLog('  Зарегистрировано: ' + registeredItems.size, 'info');
     addLog('═══════════════════════════════', 'warn');
     
     var btn = document.getElementById('syncBtn');
@@ -1259,9 +1679,11 @@ function syncData() {
     });
 }
 
-addLog('Script started v7.2 (калькулятор + адаптация)', 'ok');
+addLog('Script started v7.3.2 (каскадное списание)', 'ok');
 addLog('🧮 Калькулятор: нажмите на поле → 🧮 → примените', 'ok');
-addLog('🔄 Если товар купили — факт автоматически скорректируется', 'ok');
+addLog('🔄 Товары регистрируются автоматически при вводе', 'ok');
+addLog('📊 При продаже — каскадное списание по товарам группы', 'ok');
+addLog('🚨 Факт никогда не уходит в отрицательные значения', 'ok');
 loadData();
 startVersionCheck();
 </script>
