@@ -66,7 +66,7 @@ class SyncQRDialog(QDialog):
         self.qr_label = QLabel()
         self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._generate_qr()
-        layout.addWidget(self.qr_label)
+        layout.addWidget(self.qr_label, alignment=Qt.AlignmentFlag.AlignCenter)
         
         url = sync_server.get_qr_url()
         self.url_label = QLabel(f"🔗 {url}")
@@ -211,7 +211,7 @@ class SyncQRDialog(QDialog):
             Qt.TransformationMode.SmoothTransformation
         )
         
-        self.qr_label.setFixedSize(size, size)
+        self.qr_label.setMinimumSize(size, size)
         self.qr_label.setScaledContents(False)
         self.qr_label.setPixmap(scaled)
         
