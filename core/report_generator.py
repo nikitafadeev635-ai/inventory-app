@@ -105,8 +105,8 @@ _register_cyrillic_font()
 # ============================================================
 #  ПАПКА ОТЧЁТОВ
 # ============================================================
-REPORTS_DIR = Path(__file__).parent.parent / "reports"
-REPORTS_DIR.mkdir(exist_ok=True)
+from core.paths import get_reports_dir
+REPORTS_DIR = get_reports_dir()
 
 
 def _sanitize_filename(name: str) -> str:

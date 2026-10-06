@@ -356,7 +356,8 @@ class InventoryCustomizerDialog(QDialog):
         if not file_path:
             return
         try:
-            project_root = Path(__file__).parent.parent
+            from core.paths import get_base_dir
+            project_root = get_base_dir()
             rel_path = os.path.relpath(file_path, project_root)
             if rel_path.startswith(".."):
                 rel_path = file_path

@@ -10,10 +10,9 @@ from gui.themes.base import Theme, ColorPalette
 from gui.themes.presets import BUILTIN_THEMES
 from gui.themes.generator import generate_stylesheet
 
-
-# Папка для пользовательских тем (в корне проекта)
-USER_THEMES_DIR = Path(__file__).parent.parent.parent / "user_themes"
-
+# Папка для пользовательских тем (рядом с .exe)
+from core.paths import get_themes_dir
+USER_THEMES_DIR = get_themes_dir()
 
 class ThemeManager:
     """Централизованный менеджер тем приложения."""

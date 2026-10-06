@@ -6,11 +6,16 @@ from pathlib import Path
 # ============================================================
 try:
     from dotenv import load_dotenv
-    env_path = Path(__file__).parent / ".env"
+    from core.paths import get_env_path
+    
+    env_path = get_env_path()
     if env_path.exists():
         load_dotenv(env_path)
+        print(f"[Config] ✓ .env загружен: {env_path}")
+    else:
+        print(f"[Config] ⚠ .env не найден: {env_path}")
 except ImportError:
-    pass 
+    pass
 
 
 SMARTSHELL_GRAPHQL_URL = "https://billing.smartshell.gg/api/graphql"
@@ -51,7 +56,9 @@ SEARCH_DEBOUNCE_MS = 300         # Задержка поиска (debounce)
 # ============================================================
 #  ФОНОВАЯ АНИМАЦИЯ
 # ============================================================
-BACKGROUND_GIF_PATH = "background.gif"
+from core.paths import get_background_gif_path
+BACKGROUND_GIF_PATH = str(get_background_gif_path())
+
 BACKGROUND_OVERLAY_ALPHA = 180   # 0-255: прозрачность затемнения поверх GIF
 
 
