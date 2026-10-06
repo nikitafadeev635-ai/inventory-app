@@ -3,20 +3,22 @@
 
 Использует:
 1. Hardware ID (motherboard serial + CPU ID)
-2. HMAC-SHA256 подпись для защиты от модификации
-3. Обфусцированный ключ в коде
+2. Подпись от сервера (BINDING_SECRET на VPS)
+3. Хранение в point.lock рядом с .exe
 
-Точка сохраняется в файле point.lock рядом с .exe или в AppData.
+v2.0 — Интеграция с серверной системой валидации:
+- point.lock содержит подпись созданную сервером
+- При запуске проверяется через /api/validate-launch
 """
 import os
 import sys
 import json
-import hmac
 import hashlib
 import subprocess
 import platform
 from pathlib import Path
 from typing import Optional, Tuple
+from datetime import datetime
 
 
 # ============================================================
@@ -28,18 +30,14 @@ def _get_lock_file_path() -> Path:
     
     Приоритет:
     1. Рядом с .exe (если запущено как .exe)
-    2. В AppData пользователя (для разработки)
+    2. В корне проекта (для разработки)
     """
     if getattr(sys, 'frozen', False):
         # Запущено как .exe
-        base_path = Path(sys.executable).parent
+        return Path(sys.executable).parent / "point.lock"
     else:
-        # Запущено как Python-скрипт — используем AppData
-        app_data = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
-        base_path = app_data / 'QFactDeductor'
-        base_path.mkdir(exist_ok=True)
-    
-    return base_path / "point.lock"
+        # Разработка — в корне проекта
+        return Path(__file__).parent.parent / "point.lock"
 
 
 # ============================================================
@@ -51,19 +49,24 @@ def get_hardware_id() -> str:
     - Motherboard Serial Number
     - CPU ID
     
-    Возвращает SHA-256 хеш от комбинации.
+    Возвращает SHA-256 хеш от комбинации (32 hex символа).
     """
     components = []
     
-    # Motherboard Serial (Windows)
     if platform.system() == "Windows":
+        # Motherboard Serial
         try:
             result = subprocess.run(
                 ['wmic', 'baseboard', 'get', 'serialnumber'],
                 capture_output=True, text=True, timeout=5
             )
             lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if len(lines) > 1:
+            if len(lines) > 1 and lines[1] not in (
+                "To be filled by O.E.M.", 
+                "Default string", 
+                "None",
+                "Base Board Serial Number"
+            ):
                 components.append(f"MB:{lines[1]}")
         except Exception:
             pass
@@ -75,7 +78,7 @@ def get_hardware_id() -> str:
                 capture_output=True, text=True, timeout=5
             )
             lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if len(lines) > 1:
+            if len(lines) > 1 and lines[1] != "ProcessorId":
                 components.append(f"CPU:{lines[1]}")
         except Exception:
             pass
@@ -93,170 +96,157 @@ def get_hardware_id() -> str:
         mac = uuid.getnode()
         components.append(f"MAC:{mac}")
     
-    # Хеш от всех компонентов
+    # Хеш от всех компонентов (сортируем для стабильности)
     combined = "|".join(sorted(components))
     return hashlib.sha256(combined.encode()).hexdigest()[:32]
 
 
 # ============================================================
-#  ОБФУСЦИРОВАННЫЙ СЕКРЕТНЫЙ КЛЮЧ
+#  🆕 ЧТЕНИЕ ДАННЫХ ИЗ POINT.LOCK
 # ============================================================
-def _get_secret_key() -> bytes:
+def get_lock_data() -> dict:
     """
-    Возвращает секретный ключ для HMAC.
+    Читает данные из point.lock.
     
+    Поддерживает два формата:
+    1. Новый (серверный): {point_name, hwid, signature, bound_at}
+    2. Старый (локальный): {point_name, hardware_id, signature}
+    
+    Returns:
+        dict с данными или пустой dict если файл не найден
     """
-    encoded = [
-        0x4A, 0x2F, 0x58, 0x71, 0x3C, 0x6B, 0x19, 0x42,
-        0x6D, 0x35, 0x7A, 0x21, 0x59, 0x44, 0x68, 0x32,
-        0x47, 0x5E, 0x28, 0x63, 0x49, 0x77, 0x3B, 0x54,
-        0x61, 0x2C, 0x4F, 0x7D, 0x38, 0x52, 0x6E, 0x24,
-    ]
-    mask = 0x5A
+    lock_path = _get_lock_file_path()
     
-    key_bytes = bytes([b ^ mask for b in encoded])
-    hw_id = get_hardware_id()
-    return hmac.new(key_bytes, hw_id.encode(), hashlib.sha256).digest()
-
-
-def _generate_key() -> None:
-    import secrets
-    key = secrets.token_bytes(32)
-    mask = 0x5A
-    encoded = [b ^ mask for b in key]
-    print("_get_secret_key):")
-    print("encoded = [")
-    for i in range(0, 32, 8):
-        chunk = ", ".join(f"0x{b:02X}" for b in encoded[i:i+8])
-        print(f"    {chunk},")
-    print("]")
-
-
-# ============================================================
-#  ПОДПИСЬ И ВЕРИФИКАЦИЯ
-# ============================================================
-def _sign_data(point_name: str, hw_id: str) -> str:
-    """Создаёт HMAC-SHA256 подпись для точки."""
-    secret = _get_secret_key()
-    message = f"{point_name}|{hw_id}".encode()
-    signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
-    return signature
-
-
-def _verify_signature(point_name: str, hw_id: str, signature: str) -> bool:
-    """Проверяет подпись точки."""
-    expected = _sign_data(point_name, hw_id)
-    return hmac.compare_digest(expected, signature)
-
-
-# ============================================================
-#  ПУБЛИЧНЫЕ ФУНКЦИИ
-# ============================================================
-def is_point_locked() -> bool:
-    """Проверяет, привязана ли точка к этому ПК."""
-    lock_file = _get_lock_file_path()
-    if not lock_file.exists():
-        return False
+    if not lock_path.exists():
+        print(f"[PointLock] ℹ️ Файл не найден: {lock_path}")
+        return {}
     
     try:
-        data = json.loads(lock_file.read_text(encoding='utf-8'))
-        return all(k in data for k in ('point_name', 'hardware_id', 'signature'))
-    except Exception:
-        return False
-
-
-def get_locked_point() -> Optional[str]:
-    """
-    Возвращает название привязанной точки или None.
-    Проверяет подпись и Hardware ID.
-    """
-    lock_file = _get_lock_file_path()
-    if not lock_file.exists():
-        return None
-    
-    try:
-        data = json.loads(lock_file.read_text(encoding='utf-8'))
-        point_name = data.get('point_name')
-        hw_id = data.get('hardware_id')
-        signature = data.get('signature')
+        with open(lock_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
         
-        if not all([point_name, hw_id, signature]):
-            return None
+        if not isinstance(data, dict):
+            print(f"[PointLock] ⚠ Файл повреждён (не JSON объект)")
+            return {}
         
-        # Проверяем что Hardware ID совпадает с текущим ПК
-        current_hw_id = get_hardware_id()
-        if hw_id != current_hw_id:
-            print(f"[PointLock] ⚠ Hardware ID не совпадает!")
-            print(f"  Файл: {hw_id[:16]}...")
-            print(f"  Текущий ПК: {current_hw_id[:16]}...")
-            return None
+        # Нормализуем ключи (поддержка обоих форматов)
+        result = {
+            "point_name": data.get("point_name"),
+            "hwid": data.get("hwid") or data.get("hardware_id"),
+            "signature": data.get("signature"),
+            "bound_at": data.get("bound_at") or data.get("created_at"),
+        }
         
-        # Проверяем подпись
-        if not _verify_signature(point_name, hw_id, signature):
-            print(f"[PointLock] ✗ Неверная подпись! Файл был изменён.")
-            return None
+        # Проверяем HWID (должен совпадать с текущим ПК)
+        if result["hwid"]:
+            current_hwid = get_hardware_id()
+            if result["hwid"] != current_hwid:
+                print(f"[PointLock] ⚠ HWID не совпадает!")
+                print(f"  В файле:  {result['hwid'][:16]}...")
+                print(f"  Текущий:  {current_hwid[:16]}...")
+                print(f"  ⚠️ Файл point.lock скопирован с другого ПК")
+                return {}
         
-        print(f"[PointLock] ✓ Точка привязана: {point_name}")
-        return point_name
-    
+        return result
+        
+    except json.JSONDecodeError as e:
+        print(f"[PointLock] ⚠ Файл повреждён (невалидный JSON): {e}")
+        return {}
     except Exception as e:
-        print(f"[PointLock] ✗ Ошибка чтения файла: {e}")
-        return None
+        print(f"[PointLock] ⚠ Ошибка чтения: {e}")
+        return {}
 
 
-def save_locked_point(point_name: str) -> Tuple[bool, str]:
+# ============================================================
+#  🆕 СОХРАНЕНИЕ ОТ СЕРВЕРА (новый формат)
+# ============================================================
+def save_point_lock_from_server(point_name: str, hwid: str, signature: str, bound_at: str = None) -> Tuple[bool, str]:
     """
-    Привязывает точку к текущему ПК.
+    Сохраняет point.lock с данными от сервера.
+    Используется активатором (activate_point.py).
+    
+    Args:
+        point_name: Название точки
+        hwid: Hardware ID (уже проверен на совпадение)
+        signature: Подпись от сервера
+        bound_at: Дата привязки
     
     Returns:
         (success: bool, message: str)
     """
     try:
-        hw_id = get_hardware_id()
-        signature = _sign_data(point_name, hw_id)
-        
         data = {
             "point_name": point_name,
-            "hardware_id": hw_id,
+            "hwid": hwid,
             "signature": signature,
-            "format_version": 1,
-            "created_at": str(pd_datetime_now()),
+            "bound_at": bound_at or datetime.now().isoformat(),
+            "format_version": 2,  # 🆕 Новая версия формата
         }
         
-        lock_file = _get_lock_file_path()
-        lock_file.parent.mkdir(parents=True, exist_ok=True)
-        lock_file.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding='utf-8'
-        )
+        lock_path = _get_lock_file_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         
+        # Если был старый read-only — снимаем
+        if lock_path.exists():
+            try:
+                os.chmod(lock_path, 0o666)
+            except Exception:
+                pass
         
+        with open(lock_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        # Устанавливаем read-only для защиты от модификации
         try:
             if platform.system() == "Windows":
-                os.chmod(lock_file, 0o444)  # read-only
+                os.chmod(lock_path, 0o444)
         except Exception:
-            pass  # на некоторых системах не сработает
+            pass
         
-        print(f"[PointLock] ✓ Точка '{point_name}' привязана к ПК")
-        print(f"[PointLock]   Hardware ID: {hw_id[:16]}...")
-        print(f"[PointLock]   Файл: {lock_file}")
+        print(f"[PointLock] ✓ point.lock сохранён: {lock_path}")
+        print(f"[PointLock]   Точка: {point_name}")
+        print(f"[PointLock]   HWID: {hwid[:16]}...")
         return True, f"Точка '{point_name}' успешно привязана"
     
     except Exception as e:
-        return False, f"Ошибка привязки: {e}"
+        return False, f"Ошибка сохранения: {e}"
+
+
+# ============================================================
+#  СОВМЕСТИМОСТЬ: СТАРЫЕ ФУНКЦИИ
+# ============================================================
+def is_point_locked() -> bool:
+    """Проверяет, привязана ли точка к этому ПК."""
+    data = get_lock_data()
+    return bool(data.get("point_name") and data.get("signature"))
+
+
+def get_locked_point() -> Optional[str]:
+    """
+    Возвращает название привязанной точки или None.
+    Проверяет подпись через серверную валидацию (в main.py).
+    """
+    data = get_lock_data()
+    return data.get("point_name") if data else None
+
+
+def save_locked_point(point_name: str) -> Tuple[bool, str]:
+    """
+    [УСТАРЕВШЕЕ] Локальная привязка точки.
+    Используйте save_point_lock_from_server() для новой системы.
+    """
+    print("[PointLock] ⚠ save_locked_point() устарела. Используйте activate_point.exe")
+    return False, "Используйте новую систему привязки через activate_point.exe"
 
 
 def unlock_point(master_password: str = None) -> Tuple[bool, str]:
     """
     Снимает привязку точки (требует мастер-пароль).
     
-    Args:
-        master_password: мастер-пароль для разблокировки
-    
-    Returns:
-        (success: bool, message: str)
+    ⚠️ В новой системе разблокировка делается через сервер
+    или удалением point.lock вручную.
     """
-    # Мастер-пароль (можно поменять)
+    # Мастер-пароль (для обратной совместимости)
     MASTER_HASH = "ae949f938254963d2e188948ea8026c011308495b8373173d815e2467b6f7e72"
     
     if master_password is None:
@@ -267,14 +257,14 @@ def unlock_point(master_password: str = None) -> Tuple[bool, str]:
         return False, "Неверный мастер-пароль"
     
     try:
-        lock_file = _get_lock_file_path()
-        if lock_file.exists():
+        lock_path = _get_lock_file_path()
+        if lock_path.exists():
             # Снимаем read-only если был
             try:
-                os.chmod(lock_file, 0o666)
+                os.chmod(lock_path, 0o666)
             except Exception:
                 pass
-            lock_file.unlink()
+            lock_path.unlink()
         
         print(f"[PointLock] ✓ Привязка снята")
         return True, "Привязка точки успешно снята"
@@ -283,7 +273,27 @@ def unlock_point(master_password: str = None) -> Tuple[bool, str]:
         return False, f"Ошибка снятия привязки: {e}"
 
 
-def pd_datetime_now():
-    """Возвращает текущее время (без импорта datetime на верхнем уровне)."""
-    from datetime import datetime
-    return datetime.now()
+# ============================================================
+#  ДИАГНОСТИКА
+# ============================================================
+def print_lock_info():
+    """Выводит информацию о текущей привязке (для отладки)"""
+    print("=" * 60)
+    print("🔐 Информация о привязке точки")
+    print("=" * 60)
+    print(f"  Путь: {_get_lock_file_path()}")
+    print(f"  HWID: {get_hardware_id()[:16]}...")
+    
+    data = get_lock_data()
+    if data:
+        print(f"  Точка: {data.get('point_name')}")
+        print(f"  HWID в файле: {data.get('hwid', '')[:16]}...")
+        print(f"  Подпись: {data.get('signature', '')[:16]}...")
+        print(f"  Привязана: {data.get('bound_at')}")
+    else:
+        print(f"  ⚠ Точка не привязана")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    print_lock_info()

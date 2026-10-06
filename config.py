@@ -66,7 +66,7 @@ PROXY_SERVER_URL = os.getenv(
     "PROXY_SERVER_URL",
     "https://78.17.47.74:8443"
 )
-API_SECRET_KEY = "aB3xk9mp2nQ5rT781jdqIasid109AA"
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
 PROXY_VERIFY_SSL = os.getenv("PROXY_VERIFY_SSL", "false").lower() == "true"
 PROXY_CERT_PATH = os.getenv("PROXY_CERT_PATH", "")
 

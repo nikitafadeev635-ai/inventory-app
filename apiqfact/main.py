@@ -750,8 +750,7 @@ async def user_agent_filter_middleware(request: Request, call_next):
 
     return await call_next(request)
 
-
-# --- 3/4: IP-whitelist + API-Key ---
+# --- 3/4: IP-whitelist + API-Key (с разделением admin/обычных путей) ---
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     client_ip = request.client.host if request.client else "unknown"
@@ -759,6 +758,10 @@ async def security_middleware(request: Request, call_next):
 
     if path == "/" or path.startswith("/api/debug/"):
         return await call_next(request)
+
+    # Инициализируем переменные для использования в Уровне 2
+    is_allowed = False
+    is_admin = False
 
     # Уровень 1: IP-whitelist
     if ALLOWED_NETWORKS or ADMIN_NETWORKS:
@@ -781,15 +784,59 @@ async def security_middleware(request: Request, call_next):
         if is_admin:
             logger.debug(f"[Security] 👑 Admin access: {client_ip} → {path}")
 
-    # Уровень 2: API-Key
-    if API_SECRET_KEY:
+    # Уровень 2: Проверка ключей (разные правила для admin и обычных путей)
+    is_admin_path = path.startswith("/api/admin/")
+    
+    if is_admin_path:
+        # ==========================================
+        # АДМИНСКИЕ ЭНДПОИНТЫ (/api/admin/*)
+        # Требуются ОБА ключа + IP в ADMIN_NETWORKS
+        # ==========================================
+        
+        # Проверка 1: IP должен быть в ADMIN_NETWORKS (страховка)
+        if ADMIN_NETWORKS and not is_admin:
+            logger.warning(f"🚫 [Security] Admin endpoint from non-admin IP: {client_ip} → {path}")
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Admin access denied: IP not in ADMIN_IPS"}
+            )
+        
+        # Проверка 2: X-API-Key обязателен
         api_key = request.headers.get("X-API-Key")
-        if api_key != API_SECRET_KEY:
-            logger.warning(f"🚫 [Security] Invalid API key from {client_ip} → {path}")
-            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+        if not API_SECRET_KEY or api_key != API_SECRET_KEY:
+            logger.warning(f"🚫 [Security] Missing/invalid API key for admin endpoint: {client_ip} → {path}")
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key"}
+            )
+        
+        # Проверка 3: X-Master-Key обязателен
+        expected_master = os.getenv("MASTER_API_KEY", "")
+        master_key = request.headers.get("X-Master-Key")
+        if not expected_master or master_key != expected_master:
+            logger.warning(f"🚫 [Security] Missing/invalid master key: {client_ip} → {path}")
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Invalid master key"}
+            )
+        
+        logger.debug(f"[Security] 🔑 Admin access granted: {client_ip} → {path}")
+    
+    else:
+        # ==========================================
+        # ОБЫЧНЫЕ ЭНДПОИНТЫ (всё что НЕ /api/admin/*)
+        # Требуется ТОЛЬКО X-API-Key
+        # ==========================================
+        if API_SECRET_KEY:
+            api_key = request.headers.get("X-API-Key")
+            if api_key != API_SECRET_KEY:
+                logger.warning(f"🚫 [Security] Invalid API key from {client_ip} → {path}")
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key"}
+                )
 
     return await call_next(request)
-
 
 # --- 4/4: Security headers (САМЫЙ ВНЕШНИЙ) ---
 @app.middleware("http")
@@ -1661,6 +1708,420 @@ async def update_google_sheets_shift(req: UpdateGoogleSheetsRequest, request: Re
         import traceback
         traceback.print_exc()
         return {"success": False, "error": str(e), "message": str(e)}
+
+
+# ============================================================
+# 🔐 СИСТЕМА ВАЛИДАЦИИ ЗАПУСКА ПРИЛОЖЕНИЯ
+# ============================================================
+
+# Конфиг для системы валидации
+MASTER_API_KEY = os.getenv("MASTER_API_KEY", "")
+BINDING_SECRET = os.getenv("BINDING_SECRET", "")
+
+
+def _create_signature(point_name: str, hwid: str) -> str:
+    """Создаёт HMAC-подпись для point.lock"""
+    import hashlib
+    data = f"{point_name}:{hwid}:{BINDING_SECRET}"
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _verify_signature(point_name: str, hwid: str, signature: str) -> bool:
+    """Проверяет подпись point.lock"""
+    expected = _create_signature(point_name, hwid)
+    return signature == expected
+
+
+def _check_master_key(request: Request) -> bool:
+    """
+    Дополнительная проверка для админских эндпоинтов.
+    Middleware уже проверил IP + оба ключа, эта функция - финальная страховка.
+    """
+    # Middleware уже проверил всё необходимое
+    # Здесь просто возвращаем True для совместимости с существующим кодом
+    return True
+
+
+# ============================================
+# POST /api/admin/register-build
+# Регистрация нового разрешённого билда
+# ============================================
+@app.post("/api/admin/register-build")
+async def register_build(request: Request):
+    """Регистрирует новый разрешённый билд (требует X-Master-Key + ADMIN_IPS)"""
+    client_ip = request.client.host if request.client else "unknown"
+    
+    if not _check_master_key(request):
+        logger.warning(f"[Security] 🚫 Invalid master key from {client_ip}")
+        raise HTTPException(403, "Invalid master key or IP not in ADMIN_IPS")
+    
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    
+    exe_hash = data.get("exe_hash")
+    version = data.get("version", "unknown")
+    comment = data.get("comment", "")
+    
+    if not exe_hash or len(exe_hash) != 64:
+        raise HTTPException(400, "Invalid hash (must be 64 hex chars)")
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO allowed_builds (hash, version, active, registered_at, registered_by, comment)
+                   VALUES (%s, %s, TRUE, NOW(), %s, %s)
+                   ON DUPLICATE KEY UPDATE 
+                   version = VALUES(version),
+                   active = TRUE,
+                   registered_at = NOW(),
+                   registered_by = VALUES(registered_by),
+                   comment = VALUES(comment)""",
+                (exe_hash, version, client_ip, comment),
+            )
+            conn.commit()
+        
+        log_audit({
+            "faname": "admin",
+            "point_name": "system",
+            "warehouse_id": 0,
+            "operation_type": "REGISTER_BUILD",
+            "product_count": 1,
+            "ip": client_ip,
+            "user_agent": request.headers.get("user-agent", ""),
+            "details": {"hash": exe_hash[:16] + "...", "version": version},
+        })
+        
+        logger.info(f"[Build] ✓ Зарегистрирован билд: {exe_hash[:16]}... v{version} from {client_ip}")
+        return {
+            "success": True,
+            "hash": exe_hash,
+            "version": version,
+            "message": f"Build v{version} registered successfully"
+        }
+    except Exception as e:
+        logger.error(f"✗ Register build error: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+# ============================================
+# POST /api/admin/bind-point
+# Привязка точки к HWID
+# ============================================
+@app.post("/api/admin/bind-point")
+async def bind_point(request: Request):
+    """Привязывает точку к HWID (требует X-Master-Key + ADMIN_IPS)"""
+    client_ip = request.client.host if request.client else "unknown"
+    
+    if not _check_master_key(request):
+        logger.warning(f"[Security] 🚫 Invalid master key from {client_ip}")
+        raise HTTPException(403, "Invalid master key or IP not in ADMIN_IPS")
+    
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    
+    point_name = data.get("point_name")
+    hwid = data.get("hwid")
+    comment = data.get("comment", "")
+    
+    if not point_name or not hwid:
+        raise HTTPException(400, "Missing point_name or hwid")
+    
+    if len(hwid) != 32:
+        raise HTTPException(400, "Invalid HWID (must be 32 hex chars)")
+    
+    signature = _create_signature(point_name, hwid)
+    bound_at = datetime.now().isoformat()
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO point_bindings (point_name, hwid, signature, bound_at, active, comment)
+                   VALUES (%s, %s, %s, NOW(), TRUE, %s)
+                   ON DUPLICATE KEY UPDATE 
+                   hwid = VALUES(hwid),
+                   signature = VALUES(signature),
+                   bound_at = NOW(),
+                   active = TRUE,
+                   comment = VALUES(comment)""",
+                (point_name, hwid, signature, comment),
+            )
+            conn.commit()
+        
+        log_audit({
+            "faname": "admin",
+            "point_name": point_name,
+            "warehouse_id": 0,
+            "operation_type": "BIND_POINT",
+            "product_count": 1,
+            "ip": client_ip,
+            "user_agent": request.headers.get("user-agent", ""),
+            "details": {"hwid": hwid[:16] + "...", "signature": signature[:16] + "..."},
+        })
+        
+        logger.info(f"[Bind] ✓ Точка '{point_name}' привязана к HWID: {hwid[:16]}... from {client_ip}")
+        return {
+            "success": True,
+            "point_name": point_name,
+            "hwid": hwid,
+            "signature": signature,
+            "bound_at": bound_at,
+        }
+    except Exception as e:
+        logger.error(f"✗ Bind point error: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+# ============================================
+# POST /api/validate-launch
+# Валидация запуска приложения
+# ============================================
+@app.post("/api/validate-launch")
+async def validate_launch(request: Request):
+    """Проверяет легитимность запуска приложения (требует X-API-Key)"""
+    client_ip = request.client.host if request.client else "unknown"
+    
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    
+    exe_hash = data.get("exe_hash")
+    hwid = data.get("hwid")
+    point_name = data.get("point_name")
+    signature = data.get("signature")
+    
+    if not all([exe_hash, hwid, point_name, signature]):
+        return {"allowed": False, "reason": "Missing required fields"}
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # Проверка 1: Билд разрешён
+            cur.execute(
+                "SELECT version, active FROM allowed_builds WHERE hash = %s",
+                (exe_hash,)
+            )
+            build = cur.fetchone()
+            
+            if not build:
+                logger.warning(f"[Validate] ❌ Неизвестный билд: {exe_hash[:16]}... from {client_ip}")
+                cur.execute(
+                    """INSERT INTO launch_attempts 
+                       (point_name, hwid, exe_hash, ip_address, result, reason)
+                       VALUES (%s, %s, %s, %s, 'denied', 'Unknown build')""",
+                    (point_name, hwid, exe_hash, client_ip)
+                )
+                conn.commit()
+                return {"allowed": False, "reason": "Unknown build. Contact administrator."}
+            
+            if not build["active"]:
+                logger.warning(f"[Validate] ❌ Билд отозван: {exe_hash[:16]}... from {client_ip}")
+                cur.execute(
+                    """INSERT INTO launch_attempts 
+                       (point_name, hwid, exe_hash, ip_address, result, reason)
+                       VALUES (%s, %s, %s, %s, 'denied', 'Build revoked')""",
+                    (point_name, hwid, exe_hash, client_ip)
+                )
+                conn.commit()
+                return {"allowed": False, "reason": "Build revoked. Update application."}
+            
+            # Проверка 2: Точка привязана
+            cur.execute(
+                "SELECT hwid, signature, active FROM point_bindings WHERE point_name = %s",
+                (point_name,)
+            )
+            binding = cur.fetchone()
+            
+            if not binding:
+                logger.warning(f"[Validate] ❌ Точка не привязана: {point_name} from {client_ip}")
+                cur.execute(
+                    """INSERT INTO launch_attempts 
+                       (point_name, hwid, exe_hash, ip_address, result, reason)
+                       VALUES (%s, %s, %s, %s, 'denied', 'Point not bound')""",
+                    (point_name, hwid, exe_hash, client_ip)
+                )
+                conn.commit()
+                return {"allowed": False, "reason": f"Point '{point_name}' not bound"}
+            
+            if not binding["active"]:
+                cur.execute(
+                    """INSERT INTO launch_attempts 
+                       (point_name, hwid, exe_hash, ip_address, result, reason)
+                       VALUES (%s, %s, %s, %s, 'denied', 'Point deactivated')""",
+                    (point_name, hwid, exe_hash, client_ip)
+                )
+                conn.commit()
+                return {"allowed": False, "reason": "Point deactivated"}
+            
+            # Проверка 3: HWID совпадает
+            if binding["hwid"] != hwid:
+                logger.warning(f"[Validate] ❌ HWID mismatch for {point_name} from {client_ip}")
+                cur.execute(
+                    """INSERT INTO launch_attempts 
+                       (point_name, hwid, exe_hash, ip_address, result, reason)
+                       VALUES (%s, %s, %s, %s, 'denied', 'HWID mismatch')""",
+                    (point_name, hwid, exe_hash, client_ip)
+                )
+                conn.commit()
+                return {"allowed": False, "reason": "HWID mismatch. Point bound to another PC."}
+            
+            # Проверка 4: Подпись валидна
+            if not _verify_signature(point_name, hwid, signature):
+                logger.warning(f"[Validate] ❌ Invalid signature for {point_name} from {client_ip}")
+                cur.execute(
+                    """INSERT INTO launch_attempts 
+                       (point_name, hwid, exe_hash, ip_address, result, reason)
+                       VALUES (%s, %s, %s, %s, 'denied', 'Invalid signature')""",
+                    (point_name, hwid, exe_hash, client_ip)
+                )
+                conn.commit()
+                return {"allowed": False, "reason": "Invalid signature in point.lock"}
+            
+            # Все проверки пройдены - обновляем last_seen и логируем успех
+            cur.execute(
+                "UPDATE point_bindings SET last_seen = NOW() WHERE point_name = %s",
+                (point_name,)
+            )
+            cur.execute(
+                """INSERT INTO launch_attempts 
+                   (point_name, hwid, exe_hash, ip_address, result, reason)
+                   VALUES (%s, %s, %s, %s, 'allowed', 'All checks passed')""",
+                (point_name, hwid, exe_hash, client_ip)
+            )
+            conn.commit()
+        
+        logger.info(f"[Validate] ✓ Запуск разрешён: {point_name}, билд {exe_hash[:16]}... from {client_ip}")
+        return {
+            "allowed": True,
+            "version": build["version"],
+            "point_name": point_name,
+        }
+    except Exception as e:
+        logger.error(f"✗ Validate launch error: {e}")
+        # В случае ошибки БД - разрешаем offline режим
+        return {"allowed": True, "reason": "Database error - offline mode", "version": "offline", "offline_mode": True}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+# ============================================
+# GET /api/admin/builds
+# Список зарегистрированных билдов
+# ============================================
+@app.get("/api/admin/builds")
+async def list_builds(request: Request):
+    """Возвращает список зарегистрированных билдов (требует X-Master-Key + ADMIN_IPS)"""
+    if not _check_master_key(request):
+        raise HTTPException(403, "Invalid master key or IP not in ADMIN_IPS")
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT hash, version, active, registered_at, registered_by, comment
+                   FROM allowed_builds 
+                   ORDER BY registered_at DESC"""
+            )
+            builds = cur.fetchall()
+        
+        return {
+            "builds": [
+                {
+                    "hash": b["hash"][:16] + "...",
+                    "full_hash": b["hash"],
+                    "version": b["version"],
+                    "active": b["active"],
+                    "registered_at": b["registered_at"].isoformat() if b["registered_at"] else None,
+                    "registered_by": b["registered_by"],
+                    "comment": b["comment"],
+                }
+                for b in builds
+            ],
+            "count": len(builds)
+        }
+    except Exception as e:
+        logger.error(f"✗ List builds error: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+# ============================================
+# GET /api/admin/points
+# Список привязанных точек
+# ============================================
+@app.get("/api/admin/points")
+async def list_points(request: Request):
+    """Возвращает список привязанных точек (требует X-Master-Key + ADMIN_IPS)"""
+    if not _check_master_key(request):
+        raise HTTPException(403, "Invalid master key or IP not in ADMIN_IPS")
+    
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT point_name, hwid, bound_at, last_seen, active, comment
+                   FROM point_bindings 
+                   ORDER BY bound_at DESC"""
+            )
+            points = cur.fetchall()
+        
+        return {
+            "points": [
+                {
+                    "name": p["point_name"],
+                    "hwid": p["hwid"][:16] + "...",
+                    "full_hwid": p["hwid"],
+                    "bound_at": p["bound_at"].isoformat() if p["bound_at"] else None,
+                    "last_seen": p["last_seen"].isoformat() if p["last_seen"] else None,
+                    "active": p["active"],
+                    "comment": p["comment"],
+                }
+                for p in points
+            ],
+            "count": len(points)
+        }
+    except Exception as e:
+        logger.error(f"✗ List points error: {e}")
+        raise HTTPException(500, f"Database error: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+    
 # ============================================================
 #  ЗАПУСК
 # ============================================================
