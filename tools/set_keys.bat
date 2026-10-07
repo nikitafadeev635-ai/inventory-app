@@ -1,5 +1,0 @@
-@echo off
-set API_SECRET_KEY=aB3xk9mp2nQ5rT781jdqIasid109AA
-set MASTER_API_KEY=BE5y32IFOgiypjNmGWMDZ0kx0j3cGWZbmISBKYlmAWUWx7ASF3aylcsweMEfzGV8
-echo ✅ Ключи установлены
-cmd /k
