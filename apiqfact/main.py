@@ -824,13 +824,16 @@ async def hwid_hash_verification_middleware(request: Request, call_next):
 
     # Если нет заголовков — пропускаем (обратная совместимость со старыми клиентами)
     if not client_hash or not client_hwid:
-        if auth_header.startswith("Bearer "):
-            # Это запрос от старого клиента без HWID/Hash
-            logger.warning(
-                f"[Security] ⚠ Legacy client without HWID/Hash headers: "
-                f"{client_ip} → {path}"
-            )
-        return await call_next(request)
+        logger.warning(
+            f"[Security] ⛔ Missing HWID/Hash headers: {client_ip} → {path}"
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "X-Client-Hash and X-Client-HWID headers required",
+                "error": "Missing security headers"
+            }
+        )
 
     # === ПРОВЕРКА 1: Hash в allowed_builds ===
     conn = None
@@ -848,25 +851,34 @@ async def hwid_hash_verification_middleware(request: Request, call_next):
                     f"🚨 [Security] Unknown build hash: "
                     f"{client_hash[:16]}... from {client_ip} → {path}"
                 )
-                # TODO: Включить блокировку после проверки:
-                # await send_telegram_alert(
-                #     f"🚨 <b>НЕИЗВЕСТНЫЙ БИЛД!</b>\n"
-                #     f"🌐 IP: <code>{client_ip}</code>\n"
-                #     f"🔐 Hash: <code>{client_hash[:16]}...</code>\n"
-                #     f"📍 Путь: {path}\n"
-                #     f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
-                # )
-                # return JSONResponse(status_code=403, content={"detail": "Unknown build hash"})
-                return await call_next(request)
+                asyncio.create_task(send_telegram_alert(
+                    f"🚨 <b>НЕИЗВЕСТНЫЙ БИЛД!</b>\n"
+                    f"🌐 IP: <code>{client_ip}</code>\n"
+                    f"🔐 Hash: <code>{client_hash[:16]}...</code>\n"
+                    f"📍 Путь: {path}\n"
+                    f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                ))
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Unknown build hash. Contact administrator."}
+                )
 
             if not build["active"]:
                 logger.warning(
                     f"🚨 [Security] Revoked build hash: "
                     f"{client_hash[:16]}... from {client_ip} → {path}"
                 )
-                # TODO: Включить блокировку:
-                # return JSONResponse(status_code=403, content={"detail": "Build revoked"})
-                return await call_next(request)
+                asyncio.create_task(send_telegram_alert(
+                    f"🚨 <b>БИЛД ОТОЗВАН!</b>\n"
+                    f"🌐 IP: <code>{client_ip}</code>\n"
+                    f"🔐 Hash: <code>{client_hash[:16]}...</code>\n"
+                    f"📍 Путь: {path}\n"
+                    f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                ))
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Build revoked. Update application."}
+                )
 
             # === ПРОВЕРКА 2: HWID в point_bindings ===
             if auth_header.startswith("Bearer "):
@@ -889,50 +901,70 @@ async def hwid_hash_verification_middleware(request: Request, call_next):
                                 f"🚨 [Security] Point not bound: {point_name} "
                                 f"from {client_ip} → {path}"
                             )
-                            # TODO: Включить блокировку:
-                            # return JSONResponse(status_code=403, content={"detail": "Point not bound"})
-                            return await call_next(request)
-
+                            asyncio.create_task(send_telegram_alert(
+                                f"🚨 <b>ТОЧКА НЕ ПРИВЯЗАНА!</b>\n"
+                                f"🏪 Точка: {point_name}\n"
+                                f"🌐 IP: <code>{client_ip}</code>\n"
+                                f"📍 Путь: {path}\n"
+                                f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                            ))
+                            return JSONResponse(
+                                status_code=403,
+                                content={"detail": "Point not bound to any HWID"}
+                            )
+                        
                         if not binding["active"]:
                             logger.warning(
                                 f"🚨 [Security] Point deactivated: {point_name} "
                                 f"from {client_ip} → {path}"
                             )
-                            # TODO: Включить блокировку:
-                            # return JSONResponse(status_code=403, content={"detail": "Point deactivated"})
-                            return await call_next(request)
-
-                        # === ПРОВЕРКА 3: HWID совпадает с привязанным ===
+                            return JSONResponse(
+                                status_code=403,
+                                content={"detail": "Point deactivated"}
+                            )
+                        
                         if binding["hwid"] != client_hwid:
                             logger.warning(
                                 f"🚨 [Security] HWID mismatch for {point_name}: "
-                                f"expected={binding['hwid'][:16]}..., "
-                                f"got={client_hwid[:16]}... from {client_ip} → {path}"
+                                f"bound={binding['hwid'][:16]}..., "
+                                f"request={client_hwid[:16]}... "
+                                f"from {client_ip} → {path}"
                             )
-                            # TODO: Включить блокировку + Telegram-алерт:
-                            # await send_telegram_alert(
-                            #     f"🚨 <b>ПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ!</b>\n"
-                            #     f"🏪 Точка: {point_name}\n"
-                            #     f"🌐 IP: <code>{client_ip}</code>\n"
-                            #     f"🔌 Ожидаемый HWID: <code>{binding['hwid'][:16]}...</code>\n"
-                            #     f"🔌 Фактический HWID: <code>{client_hwid[:16]}...</code>\n"
-                            #     f"📍 Путь: {path}\n"
-                            #     f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-                            #     f"<i>Возможна попытка использования чужого токена!</i>"
-                            # )
-                            # return JSONResponse(status_code=403, content={"detail": "HWID mismatch"})
-                            return await call_next(request)
-
-                        # === ПРОВЕРКА 4: HWID в JWT совпадает с HWID в запросе ===
+                            asyncio.create_task(send_telegram_alert(
+                                f"🚨 <b>HWID MISMATCH!</b>\n"
+                                f"🏪 Точка: {point_name}\n"
+                                f"🔐 Bound HWID: <code>{binding['hwid'][:16]}...</code>\n"
+                                f"🔐 Request HWID: <code>{client_hwid[:16]}...</code>\n"
+                                f"🌐 IP: <code>{client_ip}</code>\n"
+                                f"📍 Путь: {path}\n"
+                                f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                            ))
+                            return JSONResponse(
+                                status_code=403,
+                                content={"detail": "HWID mismatch. Point bound to another PC."}
+                            )
+                        
                         if jwt_hwid and jwt_hwid != client_hwid:
                             logger.warning(
-                                f"🚨 [Security] JWT HWID mismatch for {point_name}: "
+                                f"🚨 [Security] JWT HWID mismatch: "
                                 f"jwt={jwt_hwid[:16]}..., "
-                                f"request={client_hwid[:16]}... from {client_ip} → {path}"
+                                f"request={client_hwid[:16]}... "
+                                f"from {client_ip} → {path}"
                             )
-                            # TODO: Включить блокировку:
-                            # return JSONResponse(status_code=403, content={"detail": "JWT HWID mismatch"})
-                            return await call_next(request)
+                            asyncio.create_task(send_telegram_alert(
+                                f"🚨 <b>JWT HWID MISMATCH!</b>\n"
+                                f"👤 Пользователь: {jwt_payload.get('faname')}\n"
+                                f"🔐 JWT HWID: <code>{jwt_hwid[:16]}...</code>\n"
+                                f"🔐 Request HWID: <code>{client_hwid[:16]}...</code>\n"
+                                f"🌐 IP: <code>{client_ip}</code>\n"
+                                f"📍 Путь: {path}\n"
+                                f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                                f"<i>Возможна попытка использовать украденный JWT!</i>"
+                            ))
+                            return JSONResponse(
+                                status_code=403,
+                                content={"detail": "JWT HWID does not match request HWID"}
+                            )
 
                         # ✅ Все проверки пройдены
                         logger.debug(
@@ -1993,13 +2025,84 @@ async def send_ref_state_with_pdf(
 #  🆕 GOOGLE SHEETS: Обновление Минуса и Спорный при закрытии смены
 # ============================================================
 @app.post("/api/google-sheets/update-shift")
-async def update_google_sheets_shift(req: UpdateGoogleSheetsRequest, request: Request):
+async def update_google_sheets_shift(
+    req: UpdateGoogleSheetsRequest,
+    request: Request,
+    user: dict = Depends(get_current_user)  # 🛡️ ОБЯЗАТЕЛЬНО JWT!
+):
     """
-    Вызывается при закрытии смены в inventory_app.
-    ЛОГИКА:
-    - Минуса УВЕЛИЧИВАЕТСЯ на total_minus (сумма недостачи к взысканию)
-    - Спорный УВЕЛИЧИВАЕТСЯ на disputed (сумма на рассмотрении)
+    Обновление Google Sheets с полной защитой.
+    
+    Требования:
+    1. Валидный JWT (Depends(get_current_user))
+    2. X-Client-Hash и X-Client-HWID (проверяется middleware)
+    3. HWID в JWT = X-Client-HWID
+    4. Faname в JWT = administrator в запросе
+    5. Monotonic increase (только увеличение значений)
+    6. Pydantic валидация (ge=0.0 для total_minus и disputed)
     """
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # ============================================================
+    #  🛡️ ПРОВЕРКА 1: HWID в JWT = X-Client-HWID в заголовке
+    # ============================================================
+    jwt_hwid = user.get("hwid")
+    request_hwid = request.headers.get("X-Client-HWID", "")
+    
+    if jwt_hwid and request_hwid and jwt_hwid != request_hwid:
+        logger.error(
+            f"[Security] 🚨 HWID MISMATCH в SHEETS! "
+            f"JWT: {jwt_hwid[:16]}... vs Request: {request_hwid[:16]}... "
+            f"from {client_ip}"
+        )
+        asyncio.create_task(send_telegram_alert(
+            f"🚨 <b>HWID MISMATCH В SHEETS!</b>\n"
+            f"👤 <b>Админ:</b> {user.get('faname')}\n"
+            f"🔐 <b>JWT HWID:</b> <code>{jwt_hwid[:16]}...</code>\n"
+            f"🔐 <b>Request HWID:</b> <code>{request_hwid[:16]}...</code>\n"
+            f"🌐 <b>IP:</b> <code>{client_ip}</code>\n"
+            f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            f"<i>⛔ Запрос заблокирован</i>"
+        ))
+        raise HTTPException(403, "HWID mismatch between JWT and request headers")
+    
+    # ============================================================
+    #  🛡️ ПРОВЕРКА 2: Faname в JWT = administrator в запросе
+    # ============================================================
+    jwt_faname = user.get("faname")
+    if jwt_faname != req.administrator:
+        logger.error(
+            f"[Security] 🚨 FANAME MISMATCH в SHEETS! "
+            f"JWT: {jwt_faname} vs Request: {req.administrator} "
+            f"from {client_ip}"
+        )
+        asyncio.create_task(send_telegram_alert(
+            f"🚨 <b>FANAME MISMATCH В SHEETS!</b>\n"
+            f"👤 <b>JWT faname:</b> {jwt_faname}\n"
+            f"👤 <b>Request admin:</b> {req.administrator}\n"
+            f"🌐 <b>IP:</b> <code>{client_ip}</code>\n"
+            f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            f"<i>⛔ Запрос заблокирован. Админ пытается изменить чужие данные!</i>"
+        ))
+        raise HTTPException(403, "Administrator mismatch: JWT faname != request administrator")
+    
+    # ============================================================
+    #  🛡️ ПРОВЕРКА 3: Если оба нуля — пропускаем (смена без расхождений)
+    # ============================================================
+    if req.total_minus == 0 and req.disputed == 0:
+        logger.info(
+            f"[GoogleSheets] ℹ️ Нулевая смена: {req.administrator} "
+            f"(всё сошлось, обновление не требуется)"
+        )
+        return {
+            "success": True,
+            "message": "Смена без расхождений, обновление не требуется",
+            "skipped": True
+        }
+    
+    # ============================================================
+    #  ПОЛУЧЕНИЕ GOOGLE SHEETS
+    # ============================================================
     try:
         ws = await asyncio.get_event_loop().run_in_executor(
             None, _get_sheets_worksheet
@@ -2008,9 +2111,12 @@ async def update_google_sheets_shift(req: UpdateGoogleSheetsRequest, request: Re
         logger.error(f"[GoogleSheets] ✗ {e}")
         return {"success": False, "error": str(e), "message": str(e)}
     except Exception as e:
-        logger.error(f"[GoogleSheets] ✗ Ошибка подключения к таблице: {e}")
-        return {"success": False, "error": f"Ошибка подключения: {str(e)}", "message": str(e)}
-
+        logger.error(f"[GoogleSheets] ✗ Ошибка подключения: {e}")
+        return {"success": False, "error": str(e), "message": str(e)}
+    
+    # ============================================================
+    #  ОБНОВЛЕНИЕ С MONOTONIC INCREASE
+    # ============================================================
     try:
         def _update():
             row_num = _find_admin_row(ws, req.administrator)
@@ -2018,25 +2124,54 @@ async def update_google_sheets_shift(req: UpdateGoogleSheetsRequest, request: Re
                 return {
                     "success": False,
                     "error": f"Администратор '{req.administrator}' не найден в таблице",
-                    "message": f"Администратор не найден",
+                    "message": "Администратор не найден",
                 }
-
+            
             minus_col = SHEETS_COLUMN_MAP["Минуса"]
             disputed_col = SHEETS_COLUMN_MAP["Спорный"]
-
+            
             current_minus = _safe_float(ws.cell(row_num, minus_col).value)
             current_disputed = _safe_float(ws.cell(row_num, disputed_col).value)
-
+            
             new_minus = current_minus + req.total_minus
             new_disputed = current_disputed + req.disputed
-
+            
+            # 🛡️ MONOTONIC INCREASE: запрещаем уменьшение
+            if new_minus < current_minus or new_disputed < current_disputed:
+                logger.error(
+                    f"[Security] 🚨 MONOTONIC INCREASE VIOLATION! "
+                    f"{req.administrator}: "
+                    f"minus {current_minus:.2f} → {new_minus:.2f} (Δ={req.total_minus:+.2f}), "
+                    f"disputed {current_disputed:.2f} → {new_disputed:.2f} (Δ={req.disputed:+.2f}) "
+                    f"from {client_ip}"
+                )
+                asyncio.create_task(send_telegram_alert(
+                    f"🚨 <b>ПОПЫТКА УМЕНЬШЕНИЯ МИНУСА!</b>\n"
+                    f"👤 <b>Админ:</b> {req.administrator}\n"
+                    f"💰 <b>Минус:</b> {current_minus:.2f}₽ → {new_minus:.2f}₽ (Δ={req.total_minus:+.2f})\n"
+                    f"⚖️ <b>Спорный:</b> {current_disputed:.2f}₽ → {new_disputed:.2f}₽ (Δ={req.disputed:+.2f})\n"
+                    f"🌐 <b>IP:</b> <code>{client_ip}</code>\n"
+                    f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                    f"<i>⛔ Запрос заблокирован. Значения НЕ изменены.</i>"
+                ))
+                return {
+                    "success": False,
+                    "error": "Decreasing values is forbidden",
+                    "message": "Уменьшение значений запрещено",
+                    "blocked": True,
+                    "current_minus": current_minus,
+                    "current_disputed": current_disputed,
+                }
+            
+            # ✅ Всё ОК — обновляем
             ws.update_cell(row_num, minus_col, new_minus)
             ws.update_cell(row_num, disputed_col, new_disputed)
-
+            
             message = (
                 f"Минуса: {current_minus:.2f} → {new_minus:.2f} (+{req.total_minus}), "
                 f"Спорный: {current_disputed:.2f} → {new_disputed:.2f} (+{req.disputed})"
             )
+            
             return {
                 "success": True,
                 "row": row_num,
@@ -2046,20 +2181,26 @@ async def update_google_sheets_shift(req: UpdateGoogleSheetsRequest, request: Re
                 "new_disputed": new_disputed,
                 "message": message,
             }
-
+        
         result = await asyncio.get_event_loop().run_in_executor(None, _update)
-
+        
         if result["success"]:
             logger.info(
-                f"[GoogleSheets] ✓ Закрытие смены '{req.administrator}' (row {result['row']}): "
-                f"Минуса {result['old_minus']} → {result['new_minus']} (+{req.total_minus}), "
-                f"Спорный {result['old_disputed']} → {result['new_disputed']} (+{req.disputed})"
+                f"[GoogleSheets] ✓ Закрытие смены '{req.administrator}' "
+                f"(row {result['row']}): "
+                f"Минуса {result['old_minus']:.2f} → {result['new_minus']:.2f} (+{req.total_minus}), "
+                f"Спорный {result['old_disputed']:.2f} → {result['new_disputed']:.2f} (+{req.disputed})"
+            )
+        elif result.get("blocked"):
+            logger.warning(
+                f"[Security] ⛔ ЗАБЛОКИРОВАНО: {req.administrator} "
+                f"попытка уменьшить значения"
             )
         else:
             logger.warning(f"[GoogleSheets] ⚠ {result['error']}")
-
+        
         return result
-
+    
     except Exception as e:
         logger.error(f"[GoogleSheets] ✗ Ошибка обновления: {e}")
         import traceback

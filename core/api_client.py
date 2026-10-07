@@ -4,11 +4,7 @@ API клиент для общения с QFact сервером (VPS).
 Отключает использование системного прокси для всех запросов
 (чтобы избежать ProxyError на порту 8443).
 
-Добавлено:
-- API Secret Key (X-API-Key) для защиты от несанкционированного доступа
-- Методы для Trouble (причины расхождений с ссылками)
-- 🆕 X-Client-Hash и X-Client-HWID в заголовках каждого запроса
-  (для middleware проверки целостности на сервере)
+v2.0 — X-Client-Hash и X-Client-HWID в заголовках КАЖДОГО запроса
 """
 import requests
 import urllib3
@@ -52,21 +48,20 @@ class ApiClient:
             print("[API] ⚠ integrity_checker недоступен — HWID/Hash не будут отправляться")
 
         # ============================================================
-        #  ЗАГОЛОВКИ ДЛЯ ВСЕХ ЗАПРОСОВ
+        #  🔑 ЗАГОЛОВКИ ДЛЯ ВСЕХ ЗАПРОСОВ
         # ============================================================
         headers = {
             "Content-Type": "application/json",
             "X-API-Key": API_SECRET_KEY,
         }
 
-        # 🆕 Добавляем HWID и Hash в заголовки (если вычислены)
+        # 🆕 Добавляем HWID и Hash в ОСНОВНУЮ сессию (для ВСЕХ запросов)
         if self._client_hash:
             headers["X-Client-Hash"] = self._client_hash
         if self._client_hwid:
             headers["X-Client-HWID"] = self._client_hwid
 
-
-
+        # Применяем заголовки ко всем последующим запросам
         self.session.headers.update(headers)
 
         self._token = None
@@ -181,7 +176,6 @@ class ApiClient:
             session.verify = False
             session.trust_env = False
             session.proxies = {"http": None, "https": None}
-            # 🆕 Используем базовые заголовки (включая HWID/Hash)
             session.headers.update(self._get_base_headers())
             response = session.post(
                 f"{self.server_url}/api/auth/verify_password",
@@ -259,14 +253,12 @@ class ApiClient:
             return {"success": False, "error": str(e)}
 
     # ============================================================
-    #  🆕 TROUBLE — причины расхождений с ссылками
+    #  TROUBLE — причины расхождений с ссылками
     # ============================================================
     def save_trouble_operations(self, operations: list, point_name: str,
                                 administrator: str, session_label: str,
                                 operation_date: str) -> dict:
-        """
-        Сохраняет trouble-операции с причинами и ссылками.
-        """
+        """Сохраняет trouble-операции с причинами и ссылками."""
         try:
             r = self.session.post(
                 f"{self.server_url}/api/inventory/save-trouble-operations",
@@ -290,9 +282,7 @@ class ApiClient:
                              cost: float, allitemTrouble: list, allitemDis: list,
                              costTrouble: float, costDisTrouble: float,
                              allRef: list, session_label: str) -> dict:
-        """
-        Сохраняет итог смены с учётом помилований.
-        """
+        """Сохраняет итог смены с учётом помилований."""
         try:
             r = self.session.post(
                 f"{self.server_url}/api/inventory/save-correct-trouble",
@@ -317,7 +307,7 @@ class ApiClient:
             return {"success": False, "id": None, "error": str(e)}
 
     # ============================================================
-    #  КЛИЕНТЫ (временно отключены на VPS, но методы оставлены)
+    #  КЛИЕНТЫ
     # ============================================================
     def search_client_by_phone(self, phone: str, point_name: str) -> dict:
         """Поиск клиента по номеру телефона через сервер."""

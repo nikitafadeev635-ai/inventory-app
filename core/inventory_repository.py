@@ -5,6 +5,15 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import httpx
 
+# 🆕 Импорт функций для HWID и хеша (для middleware проверки на сервере)
+try:
+    from core.integrity_checker import get_exe_hash, get_hardware_id
+    _INTEGRITY_AVAILABLE = True
+except ImportError:
+    _INTEGRITY_AVAILABLE = False
+    get_exe_hash = lambda: ""
+    get_hardware_id = lambda: ""
+
 
 class InventoryRepository:
     """Сохраняет операции и итоги смен в БД через прокси-сервер."""
@@ -50,10 +59,26 @@ class InventoryRepository:
                 getattr(client, '_access_token', None)
             )
         
+        # 🆕 ВЫЧИСЛЕНИЕ HWID И HASH (один раз при инициализации)
+        # Критически важно для middleware проверки на сервере!
+        self._client_hash = ""
+        self._client_hwid = ""
+        
+        if _INTEGRITY_AVAILABLE:
+            try:
+                self._client_hash = get_exe_hash() or ""
+                self._client_hwid = get_hardware_id() or ""
+            except Exception as e:
+                print(f"[InventoryRepository] ⚠ Ошибка вычисления HWID/Hash: {e}")
+                self._client_hash = ""
+                self._client_hwid = ""
+        
         print(f"[InventoryRepository] Инициализация:")
         print(f"  base_url: {self._base_url}")
         print(f"  token: {'есть' if self._token else 'НЕТ!'}")
         print(f"  api_key: {'есть' if self._api_key else 'НЕТ'}")
+        print(f"  HWID: {self._client_hwid[:16] + '...' if self._client_hwid else '—'}")
+        print(f"  Hash: {self._client_hash[:16] + '...' if self._client_hash else '—'}")
     
     def _get_headers(self) -> dict:
         headers = {
@@ -64,6 +89,14 @@ class InventoryRepository:
             headers["Authorization"] = f"Bearer {self._token}"
         if self._api_key:
             headers["X-API-Key"] = self._api_key
+        
+        # 🆕 КРИТИЧНО: Добавляем HWID и Hash для middleware проверки на сервере
+        # Без этих заголовков сервер видит запрос как "Legacy client"
+        if self._client_hash:
+            headers["X-Client-Hash"] = self._client_hash
+        if self._client_hwid:
+            headers["X-Client-HWID"] = self._client_hwid
+        
         return headers
     
     def _post(self, endpoint: str, payload: dict) -> Optional[httpx.Response]:
