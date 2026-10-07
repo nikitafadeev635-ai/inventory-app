@@ -1,17 +1,28 @@
 """
 API клиент для общения с QFact сервером (VPS).
 Заменяет прямые запросы к SmartShell.
-
 Отключает использование системного прокси для всех запросов
 (чтобы избежать ProxyError на порту 8443).
 
 Добавлено:
 - API Secret Key (X-API-Key) для защиты от несанкционированного доступа
 - Методы для Trouble (причины расхождений с ссылками)
+- 🆕 X-Client-Hash и X-Client-HWID в заголовках каждого запроса
+  (для middleware проверки целостности на сервере)
 """
 import requests
 import urllib3
+
 from config import PROXY_SERVER_URL, PROXY_VERIFY_SSL, PROXY_CERT_PATH, API_SECRET_KEY
+
+# 🆕 Импорт функций для вычисления HWID и хеша .exe
+try:
+    from core.integrity_checker import get_exe_hash, get_hardware_id
+    _INTEGRITY_AVAILABLE = True
+except ImportError:
+    _INTEGRITY_AVAILABLE = False
+    get_exe_hash = lambda: ""
+    get_hardware_id = lambda: ""
 
 
 class ApiClient:
@@ -20,14 +31,44 @@ class ApiClient:
     def __init__(self):
         self.server_url = PROXY_SERVER_URL
         self.session = requests.Session()
-        
+
+        # ============================================================
+        #  🆕 ВЫЧИСЛЕНИЕ HWID И HASH (один раз при инициализации)
+        # ============================================================
+        self._client_hash = ""
+        self._client_hwid = ""
+
+        if _INTEGRITY_AVAILABLE:
+            try:
+                self._client_hash = get_exe_hash() or ""
+                self._client_hwid = get_hardware_id() or ""
+                print(f"[API] ✓ HWID: {self._client_hwid[:16]}...")
+                print(f"[API] ✓ Hash: {self._client_hash[:16]}...")
+            except Exception as e:
+                print(f"[API] ⚠ Ошибка вычисления HWID/Hash: {e}")
+                self._client_hash = ""
+                self._client_hwid = ""
+        else:
+            print("[API] ⚠ integrity_checker недоступен — HWID/Hash не будут отправляться")
+
         # ============================================================
         #  ЗАГОЛОВКИ ДЛЯ ВСЕХ ЗАПРОСОВ
         # ============================================================
-        self.session.headers.update({
+        headers = {
             "Content-Type": "application/json",
             "X-API-Key": API_SECRET_KEY,
-        })
+        }
+
+        # 🆕 Добавляем HWID и Hash в заголовки (если вычислены)
+        if self._client_hash:
+            headers["X-Client-Hash"] = self._client_hash
+        if self._client_hwid:
+            headers["X-Client-HWID"] = self._client_hwid
+
+
+
+        self.session.headers.update(headers)
+
         self._token = None
 
         # ============================================================
@@ -46,6 +87,21 @@ class ApiClient:
             print(f"[API] ⚠ SSL verification disabled (self-signed cert)")
         elif PROXY_CERT_PATH:
             self.session.verify = PROXY_CERT_PATH
+
+    # ============================================================
+    #  ВСПОМОГАТЕЛЬНЫЙ МЕТОД: заголовки для отдельной сессии
+    # ============================================================
+    def _get_base_headers(self) -> dict:
+        """Возвращает базовые заголовки (для методов которые создают свою сессию)"""
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": API_SECRET_KEY,
+        }
+        if self._client_hash:
+            headers["X-Client-Hash"] = self._client_hash
+        if self._client_hwid:
+            headers["X-Client-HWID"] = self._client_hwid
+        return headers
 
     # ============================================================
     #  АВТОРИЗАЦИЯ
@@ -90,10 +146,10 @@ class ApiClient:
                 return data.get("goods", [])
             if r.status_code == 401:
                 print("[API] ✗ Токен истёк — требуется повторная авторизация")
-            return []
+                return []
         except Exception as e:
             print(f"[API] ✗ fetch_goods error: {e}")
-            return []
+        return []
 
     # ============================================================
     #  СОТРУДНИКИ
@@ -111,7 +167,6 @@ class ApiClient:
             finally:
                 if old_auth:
                     self.session.headers["Authorization"] = old_auth
-
             if r.status_code == 200:
                 return r.json().get("employees", [])
             return []
@@ -126,17 +181,13 @@ class ApiClient:
             session.verify = False
             session.trust_env = False
             session.proxies = {"http": None, "https": None}
-            session.headers.update({
-                "Content-Type": "application/json",
-                "X-API-Key": API_SECRET_KEY,
-            })
-
+            # 🆕 Используем базовые заголовки (включая HWID/Hash)
+            session.headers.update(self._get_base_headers())
             response = session.post(
                 f"{self.server_url}/api/auth/verify_password",
                 json={"faname": faname, "password": password},
                 timeout=10,
             )
-
             if response.status_code == 200:
                 data = response.json()
                 print(f"[ApiClient] verify_password({faname}): "
@@ -145,7 +196,6 @@ class ApiClient:
             else:
                 print(f"[ApiClient] ✗ HTTP {response.status_code}: {response.text}")
                 return {"verified": False, "error": f"HTTP {response.status_code}"}
-
         except Exception as e:
             print(f"[ApiClient] ✗ Ошибка verify_password: {e}")
             return {"verified": False, "error": str(e)}
@@ -216,17 +266,6 @@ class ApiClient:
                                 operation_date: str) -> dict:
         """
         Сохраняет trouble-операции с причинами и ссылками.
-        
-        Args:
-            operations: список операций [{product_id, product_title, quantity,
-                        cost, operation_type, reason, reference, is_excusable}, ...]
-            point_name: название точки
-            administrator: ФИО администратора
-            session_label: метка смены
-            operation_date: дата в ISO формате
-        
-        Returns:
-            {"success": bool, "inserted": int, "error": str | None}
         """
         try:
             r = self.session.post(
@@ -253,20 +292,6 @@ class ApiClient:
                              allRef: list, session_label: str) -> dict:
         """
         Сохраняет итог смены с учётом помилований.
-        
-        Args:
-            point_name: название точки
-            administrator: ФИО администратора
-            cost: чистая недостача (из session_dispol)
-            allitemTrouble: все товары с расхождениями
-            allitemDis: товары из групп с чистой недостачей
-            costTrouble: сумма по неуважительным причинам ("не знаю")
-            costDisTrouble: cost - costTrouble (итог к возмещению)
-            allRef: ссылки на все объекты с уважительными причинами
-            session_label: метка смены
-        
-        Returns:
-            {"success": bool, "id": int | None, "error": str | None}
         """
         try:
             r = self.session.post(
@@ -307,7 +332,6 @@ class ApiClient:
             finally:
                 if old_auth:
                     self.session.headers["Authorization"] = old_auth
-            
             if r.status_code == 200:
                 return r.json()
             else:
@@ -342,7 +366,6 @@ class ApiClient:
             finally:
                 if old_auth:
                     self.session.headers["Authorization"] = old_auth
-            
             if r.status_code == 200:
                 return r.json()
             else:
@@ -358,3 +381,13 @@ class ApiClient:
     @property
     def is_authenticated(self) -> bool:
         return self._token is not None
+
+    @property
+    def client_hwid(self) -> str:
+        """Возвращает HWID текущего ПК (для отладки)."""
+        return self._client_hwid
+
+    @property
+    def client_hash(self) -> str:
+        """Возвращает hash текущего .exe (для отладки)."""
+        return self._client_hash

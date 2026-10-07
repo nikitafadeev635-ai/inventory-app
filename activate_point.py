@@ -1,256 +1,299 @@
 """
-Модуль привязки точки продаж к конкретному ПК.
-
+Мастер привязки точки продаж к ПК.
 Использует:
-1. Hardware ID (motherboard serial + CPU ID)
-2. Подпись от сервера (BINDING_SECRET на VPS)
-3. Хранение в point.lock рядом с .exe
+- point_lock.py для работы с point.lock
+- integrity_checker.py для вычисления HWID и хеша
+- HTTP запросы к серверу для получения подписи
 
-v2.0 — Интеграция с серверной системой валидации:
-- point.lock содержит подпись созданную сервером
-- При запуске проверяется через /api/validate-launch
+Использование:
+  activate_point.exe --bind          # Интерактивный режим
+  activate_point.exe --bind --point Ульяновская --master-password xxx
+  activate_point.exe --info          # Показать текущую привязку
 """
-import os
 import sys
-import json
-import hashlib
-import subprocess
-import platform
+import os
+import httpx
+import getpass
 from pathlib import Path
-from typing import Optional, Tuple
-from datetime import datetime
+
+# Добавляем путь к core модулям
+sys.path.insert(0, str(Path(__file__).parent))
+
+from core.point_lock import (
+    get_hardware_id,
+    save_point_lock_from_server,
+    print_lock_info,
+    _get_lock_file_path,
+)
+from core.integrity_checker import get_exe_hash
+from config import PROXY_SERVER_URL, API_SECRET_KEY
 
 
 # ============================================================
-#  ПУТЬ К ФАЙЛУ ПРИВЯЗКИ
+#  КОНСТАНТЫ
 # ============================================================
-def _get_lock_file_path() -> Path:
-    """
-    Возвращает путь к файлу point.lock.
+AVAILABLE_POINTS = [
+    "Русская",
+    "Сахалинская",
+    "Трамвайная",
+    "Светланская",
+    "Ульяновская",
+    "Калинина",
+]
+
+
+# ============================================================
+#  ИНТЕРАКТИВНЫЙ РЕЖИМ
+# ============================================================
+def interactive_bind():
+    """Интерактивный режим привязки точки"""
+    print("=" * 60)
+    print("🔐 Мастер привязки точки продаж")
+    print("=" * 60)
+    print()
     
-    Приоритет:
-    1. Рядом с .exe (если запущено как .exe)
-    2. В корне проекта (для разработки)
-    """
-    if getattr(sys, 'frozen', False):
-        # Запущено как .exe
-        return Path(sys.executable).parent / "point.lock"
-    else:
-        # Разработка — в корне проекта
-        return Path(__file__).parent.parent / "point.lock"
-
-
-# ============================================================
-#  HARDWARE ID
-# ============================================================
-def get_hardware_id() -> str:
-    """
-    Получает уникальный идентификатор ПК на основе:
-    - Motherboard Serial Number
-    - CPU ID
+    # Шаг 1: Мастер-пароль
+    try:
+        master_password = getpass.getpass("Введите мастер-пароль: ")
+    except (KeyboardInterrupt, EOFError):
+        print("\n\n❌ Отменено пользователем")
+        return False
     
-    Возвращает SHA-256 хеш от комбинации (32 hex символа).
-    """
-    components = []
+    if not master_password:
+        print("❌ Мастер-пароль не может быть пустым")
+        return False
     
-    if platform.system() == "Windows":
-        # Motherboard Serial
+    # Шаг 2: Выбор точки
+    print("\nДоступные точки:")
+    for idx, point in enumerate(AVAILABLE_POINTS, 1):
+        print(f"  {idx}. {point}")
+    
+    print()
+    while True:
         try:
-            result = subprocess.run(
-                ['wmic', 'baseboard', 'get', 'serialnumber'],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if len(lines) > 1 and lines[1] not in (
-                "To be filled by O.E.M.", 
-                "Default string", 
-                "None",
-                "Base Board Serial Number"
-            ):
-                components.append(f"MB:{lines[1]}")
-        except Exception:
-            pass
-        
-        # CPU ID
-        try:
-            result = subprocess.run(
-                ['wmic', 'cpu', 'get', 'processorid'],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if len(lines) > 1 and lines[1] != "ProcessorId":
-                components.append(f"CPU:{lines[1]}")
-        except Exception:
-            pass
-    else:
-        # Linux/macOS fallback
-        try:
-            with open('/etc/machine-id', 'r') as f:
-                components.append(f"MACHINE:{f.read().strip()}")
-        except Exception:
-            pass
+            choice = input("Выберите номер точки (1-6): ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(AVAILABLE_POINTS):
+                point_name = AVAILABLE_POINTS[idx]
+                break
+            print("❌ Неверный номер. Попробуйте снова.")
+        except ValueError:
+            print("❌ Введите число от 1 до 6")
+        except (KeyboardInterrupt, EOFError):
+            print("\n\n❌ Отменено пользователем")
+            return False
     
-    # Fallback: MAC-адрес если ничего не нашли
-    if not components:
-        import uuid
-        mac = uuid.getnode()
-        components.append(f"MAC:{mac}")
+    print(f"\n✓ Выбрана точка: {point_name}")
     
-    # Хеш от всех компонентов (сортируем для стабильности)
-    combined = "|".join(sorted(components))
-    return hashlib.sha256(combined.encode()).hexdigest()[:32]
+    # Шаг 3: Привязка
+    return perform_binding(point_name, master_password)
 
 
 # ============================================================
-#  🆕 ЧТЕНИЕ ДАННЫХ ИЗ POINT.LOCK
+#  РЕАЛЬНАЯ ЛОГИКА ПРИВЯЗКИ
 # ============================================================
-def get_lock_data() -> dict:
+def perform_binding(point_name: str, master_password: str) -> bool:
     """
-    Читает данные из point.lock.
+    Выполняет привязку точки через сервер.
     
-    Поддерживает два формата:
-    1. Новый (серверный): {point_name, hwid, signature, bound_at}
-    2. Старый (локальный): {point_name, hardware_id, signature}
-    
-    Returns:
-        dict с данными или пустой dict если файл не найден
+    Процесс:
+    1. Вычислить HWID текущего ПК
+    2. Отправить запрос на сервер с master_password
+    3. Получить подпись (signature) от сервера
+    4. Сохранить point.lock локально
     """
-    lock_path = _get_lock_file_path()
+    print("\n" + "=" * 60)
+    print("🔄 Выполняется привязка...")
+    print("=" * 60)
     
-    if not lock_path.exists():
-        print(f"[PointLock] ℹ️ Файл не найден: {lock_path}")
-        return {}
+    # Вычисляем HWID
+    hwid = get_hardware_id()
+    exe_hash = get_exe_hash()
+    
+    print(f"\n📊 Данные клиента:")
+    print(f"  HWID:     {hwid[:16]}...")
+    print(f"  Хеш .exe: {exe_hash[:16] if exe_hash else '—'}...")
+    print(f"  Точка:    {point_name}")
+    print(f"  Сервер:   {PROXY_SERVER_URL}")
+    
+    # Отправляем запрос на сервер
+    print("\n📤 Отправка запроса на сервер...")
     
     try:
-        with open(lock_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with httpx.Client(verify=False, timeout=15) as client:
+            response = client.post(
+                f"{PROXY_SERVER_URL}/api/admin/bind-point",
+                headers={
+                    "X-API-Key": API_SECRET_KEY,
+                    "X-Master-Key": master_password,  # ← Мастер-пароль как Master-Key
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "point_name": point_name,
+                    "hwid": hwid,
+                    "exe_hash": exe_hash,
+                }
+            )
         
-        if not isinstance(data, dict):
-            print(f"[PointLock] ⚠ Файл повреждён (не JSON объект)")
-            return {}
+        # Обрабатываем ответ
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success"):
+                signature = data["signature"]
+                bound_at = data.get("bound_at")
+                
+                # Сохраняем point.lock
+                success, message = save_point_lock_from_server(
+                    point_name=point_name,
+                    hwid=hwid,
+                    signature=signature,
+                    bound_at=bound_at
+                )
+                
+                if success:
+                    print("\n" + "=" * 60)
+                    print("✅ ПРИВЯЗКА ЗАВЕРШЕНА УСПЕШНО!")
+                    print("=" * 60)
+                    print(f"  Точка:    {point_name}")
+                    print(f"  HWID:     {hwid[:16]}...")
+                    print(f"  Файл:     {_get_lock_file_path()}")
+                    print()
+                    print("Теперь можно запускать inventory_app.exe")
+                    print("=" * 60)
+                    return True
+                else:
+                    print(f"\n❌ Ошибка сохранения: {message}")
+                    return False
+            else:
+                print(f"\n❌ Сервер вернул ошибку: {data}")
+                return False
         
-        # Нормализуем ключи (поддержка обоих форматов)
-        result = {
-            "point_name": data.get("point_name"),
-            "hwid": data.get("hwid") or data.get("hardware_id"),
-            "signature": data.get("signature"),
-            "bound_at": data.get("bound_at") or data.get("created_at"),
-        }
+        elif response.status_code == 401:
+            print("\n❌ Неверный API-Key")
+            return False
         
-        # Проверяем HWID (должен совпадать с текущим ПК)
-        if result["hwid"]:
-            current_hwid = get_hardware_id()
-            if result["hwid"] != current_hwid:
-                print(f"[PointLock] ⚠ HWID не совпадает!")
-                print(f"  В файле:  {result['hwid'][:16]}...")
-                print(f"  Текущий:  {current_hwid[:16]}...")
-                print(f"  ⚠️ Файл point.lock скопирован с другого ПК")
-                return {}
+        elif response.status_code == 403:
+            print("\n❌ Неверный мастер-пароль или IP не в ADMIN_IPS")
+            print(f"   Ответ сервера: {response.text[:200]}")
+            return False
+        
+        elif response.status_code == 404:
+            print(f"\n❌ Точка '{point_name}' не найдена в базе данных")
+            return False
+        
+        else:
+            print(f"\n❌ Ошибка сервера: HTTP {response.status_code}")
+            print(f"   Ответ: {response.text[:200]}")
+            return False
+            
+    except httpx.TimeoutException:
+        print("\n❌ Таймаут подключения к серверу")
+        return False
+    except httpx.ConnectError:
+        print(f"\n❌ Не удалось подключиться к серверу: {PROXY_SERVER_URL}")
+        return False
+    except Exception as e:
+        print(f"\n❌ Ошибка: {type(e).__name__}: {e}")
+        return False
+
+
+# ============================================================
+#  ПАРСИНГ АРГУМЕНТОВ
+# ============================================================
+def parse_args():
+    """Разбирает аргументы командной строки"""
+    args = sys.argv[1:]
+    
+    if not args or "--info" in args:
+        return {"mode": "info"}
+    
+    if "--bind" in args:
+        result = {"mode": "bind"}
+        
+        # Ищем --point
+        for i, arg in enumerate(args):
+            if arg == "--point" and i + 1 < len(args):
+                result["point_name"] = args[i + 1]
+            elif arg == "--master-password" and i + 1 < len(args):
+                result["master_password"] = args[i + 1]
         
         return result
-        
-    except json.JSONDecodeError as e:
-        print(f"[PointLock] ⚠ Файл повреждён (невалидный JSON): {e}")
-        return {}
-    except Exception as e:
-        print(f"[PointLock] ⚠ Ошибка чтения: {e}")
-        return {}
-
-
-# ============================================================
-#  🆕 СОХРАНЕНИЕ ОТ СЕРВЕРА (новый формат)
-# ============================================================
-def save_point_lock_from_server(point_name: str, hwid: str, signature: str, bound_at: str = None) -> Tuple[bool, str]:
-    """
-    Сохраняет point.lock с данными от сервера.
-    Используется активатором (activate_point.py).
     
-    Args:
-        point_name: Название точки
-        hwid: Hardware ID (уже проверен на совпадение)
-        signature: Подпись от сервера
-        bound_at: Дата привязки
+    if "--help" in args or "-h" in args:
+        return {"mode": "help"}
     
-    Returns:
-        (success: bool, message: str)
-    """
-    try:
-        data = {
-            "point_name": point_name,
-            "hwid": hwid,
-            "signature": signature,
-            "bound_at": bound_at or datetime.now().isoformat(),
-            "format_version": 2,  # 🆕 Новая версия формата
-        }
-        
-        lock_path = _get_lock_file_path()
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Если был старый read-only — снимаем
-        if lock_path.exists():
-            try:
-                os.chmod(lock_path, 0o666)
-            except Exception:
-                pass
-        
-        with open(lock_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        # Устанавливаем read-only для защиты от модификации
-        try:
-            if platform.system() == "Windows":
-                os.chmod(lock_path, 0o444)
-        except Exception:
-            pass
-        
-        print(f"[PointLock] ✓ point.lock сохранён: {lock_path}")
-        print(f"[PointLock]   Точка: {point_name}")
-        print(f"[PointLock]   HWID: {hwid[:16]}...")
-        return True, f"Точка '{point_name}' успешно привязана"
+    return {"mode": "info"}
+
+
+def print_help():
+    """Выводит справку"""
+    print("""
+🔐 Мастер привязки точки продаж
+================================
+
+Использование:
+  activate_point.exe --bind                           Интерактивный режим
+  activate_point.exe --bind --point Ульяновская       С указанием точки
+  activate_point.exe --info                           Показать текущую привязку
+  activate_point.exe --help                           Эта справка
+
+Параметры:
+  --bind                  Запустить процесс привязки
+  --point <название>      Название точки (не обязательно)
+  --master-password <pw>  Мастер-пароль (не рекомендуется - виден в истории)
+  --info                  Показать информацию о текущей привязке
+  --help, -h              Показать эту справку
+
+Примеры:
+  activate_point.exe --bind
+  activate_point.exe --bind --point Ульяновская
+  activate_point.exe --info
+""")
+
+
+# ============================================================
+#  ГЛАВНАЯ ФУНКЦИЯ
+# ============================================================
+def main():
+    args = parse_args()
     
-    except Exception as e:
-        return False, f"Ошибка сохранения: {e}"
-
-
-# ============================================================
-#  ПУБЛИЧНЫЕ ФУНКЦИИ
-# ============================================================
-def is_point_locked() -> bool:
-    """Проверяет, привязана ли точка к этому ПК."""
-    data = get_lock_data()
-    return bool(data.get("point_name") and data.get("signature"))
-
-
-def get_locked_point() -> Optional[str]:
-    """
-    Возвращает название привязанной точки или None.
-    Проверяет подпись через серверную валидацию (в main.py).
-    """
-    data = get_lock_data()
-    return data.get("point_name") if data else None
-
-
-# ============================================================
-#  ДИАГНОСТИКА
-# ============================================================
-def print_lock_info():
-    """Выводит информацию о текущей привязке (для отладки)"""
-    print("=" * 60)
-    print("🔐 Информация о привязке точки")
-    print("=" * 60)
-    print(f"  Путь: {_get_lock_file_path()}")
-    print(f"  HWID: {get_hardware_id()[:16]}...")
+    if args["mode"] == "help":
+        print_help()
+        return 0
     
-    data = get_lock_data()
-    if data:
-        print(f"  Точка: {data.get('point_name')}")
-        print(f"  HWID в файле: {data.get('hwid', '')[:16]}...")
-        print(f"  Подпись: {data.get('signature', '')[:16]}...")
-        print(f"  Привязана: {data.get('bound_at')}")
-    else:
-        print(f"  ⚠ Точка не привязана")
-    print("=" * 60)
+    if args["mode"] == "info":
+        print_lock_info()
+        return 0
+    
+    if args["mode"] == "bind":
+        # Если переданы все параметры — используем их
+        if "point_name" in args and "master_password" in args:
+            point_name = args["point_name"]
+            master_password = args["master_password"]
+            
+            if point_name not in AVAILABLE_POINTS:
+                print(f"❌ Неизвестная точка: {point_name}")
+                print(f"   Доступные: {', '.join(AVAILABLE_POINTS)}")
+                return 1
+            
+            success = perform_binding(point_name, master_password)
+            return 0 if success else 1
+        
+        # Иначе — интерактивный режим
+        success = interactive_bind()
+        return 0 if success else 1
+    
+    return 1
 
 
 if __name__ == "__main__":
-    print_lock_info()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n\n❌ Прервано пользователем")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

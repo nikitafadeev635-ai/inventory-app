@@ -19,7 +19,7 @@ import platform
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import datetime
-
+from core.hardware import get_hardware_id
 
 # ============================================================
 #  ПУТЬ К ФАЙЛУ ПРИВЯЗКИ
@@ -38,68 +38,6 @@ def _get_lock_file_path() -> Path:
     else:
         # Разработка — в корне проекта
         return Path(__file__).parent.parent / "point.lock"
-
-
-# ============================================================
-#  HARDWARE ID
-# ============================================================
-def get_hardware_id() -> str:
-    """
-    Получает уникальный идентификатор ПК на основе:
-    - Motherboard Serial Number
-    - CPU ID
-    
-    Возвращает SHA-256 хеш от комбинации (32 hex символа).
-    """
-    components = []
-    
-    if platform.system() == "Windows":
-        # Motherboard Serial
-        try:
-            result = subprocess.run(
-                ['wmic', 'baseboard', 'get', 'serialnumber'],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if len(lines) > 1 and lines[1] not in (
-                "To be filled by O.E.M.", 
-                "Default string", 
-                "None",
-                "Base Board Serial Number"
-            ):
-                components.append(f"MB:{lines[1]}")
-        except Exception:
-            pass
-        
-        # CPU ID
-        try:
-            result = subprocess.run(
-                ['wmic', 'cpu', 'get', 'processorid'],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if len(lines) > 1 and lines[1] != "ProcessorId":
-                components.append(f"CPU:{lines[1]}")
-        except Exception:
-            pass
-    else:
-        # Linux/macOS fallback
-        try:
-            with open('/etc/machine-id', 'r') as f:
-                components.append(f"MACHINE:{f.read().strip()}")
-        except Exception:
-            pass
-    
-    # Fallback: MAC-адрес если ничего не нашли
-    if not components:
-        import uuid
-        mac = uuid.getnode()
-        components.append(f"MAC:{mac}")
-    
-    # Хеш от всех компонентов (сортируем для стабильности)
-    combined = "|".join(sorted(components))
-    return hashlib.sha256(combined.encode()).hexdigest()[:32]
-
 
 # ============================================================
 #  🆕 ЧТЕНИЕ ДАННЫХ ИЗ POINT.LOCK
