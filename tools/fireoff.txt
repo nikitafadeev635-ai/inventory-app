@@ -1,0 +1,1 @@
+netsh advfirewall firewall add rule name="QFact Sync Server" dir=in action=allow program="C:\QFactInv\inventory_app.exe" protocol=TCP localport=8080

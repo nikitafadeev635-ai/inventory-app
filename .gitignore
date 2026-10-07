@@ -1,50 +1,35 @@
-# ============================================
-#  БОЛЬШИЕ ФАЙЛЫ (НЕ коммитим в Git)
-# ============================================
-# Анимации и медиа
-*.gif
-*.mp4
-*.mov
-*.avi
-*.webm
-
-# Отчёты (генерируются локально)
-reports/
-*.pdf
-
-# Базы данных
-*.db
-*.sqlite
-*.sqlite3
-*.sql
-
-# Логи
-logs/
-*.log
-
-# Кеш и временные файлы
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.cache/
-*.cache
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
 
-# Секреты
-.env
+# Virtual Environment
+venv/
+env/
 .env.local
-config.local.py
-*.pem
-*.key
-certs/
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
-credentials.json
+*~
+
+# Логи и временные файлы
+logs/
+*.log
+reports/
+cache/
+
+# Секреты (НИКОГДА не коммитить!)
+.env
+apiqfact/.env
+apiqfact/credentials.json
+apiqfact/certs/*.key
+apiq
