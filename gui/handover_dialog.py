@@ -396,37 +396,68 @@ class HandoverDialog(QDialog):
                 self.selected_point
             )
             
-            if login_result.get("success"):
-                current_session.point_name = self.selected_point
-                current_session.giver = giver_faname
-                current_session.receiver = receiver_faname
-                current_session.is_open = True
-                current_session.start_time = datetime.now()
-                current_session.shift_type = self._determine_shift_type()
-                current_session.shift_label = (
-                    f"{current_session.start_time.strftime('%d.%m.%Y %H:%M')}, "
-                    f"{current_session.shift_type}"
-                )
-                
-                print(f"[HandoverDialog] ✓ Сессия создана:")
-                print(f"  Отдающий: {giver_faname}")
-                print(f"  Принимающий: {receiver_faname}")
-                print(f"  Точка: {self.selected_point}")
-                
-                self.accept()
-            else:
-                error = login_result.get("error", "Неизвестная ошибка")
+            # ============================================================
+            #  ПРОВЕРКА РЕЗУЛЬТАТА (СОВМЕСТИМО со старым форматом)
+            # ============================================================
+            login_failed = False
+            error_msg = ""
+            
+            if login_result is None or login_result is False:
+                login_failed = True
+                error_msg = f"login() вернул {login_result}"
+            elif isinstance(login_result, dict):
+                if "error" in login_result or "detail" in login_result:
+                    login_failed = True
+                    error_msg = login_result.get("error") or login_result.get("detail")
+                elif not login_result.get("access_token") and not login_result.get("success"):
+                    login_failed = True
+                    error_msg = "Нет access_token в ответе"
+            
+            if login_failed:
                 QMessageBox.critical(
                     self, "Ошибка авторизации",
-                    f"Не удалось создать сессию:\n\n{error}"
+                    f"Не удалось создать сессию.\n\nПричина: {error_msg}"
                 )
                 self.status_label.setText("")
                 self.start_btn.setEnabled(True)
+                return
+            
+            # ============================================================
+            #  СОХРАНЕНИЕ ДАННЫХ СЕССИИ
+            # ============================================================
+            from core.session import current_session
+            current_session.giver = giver_faname
+            current_session.receiver = receiver_faname
+            current_session.point_name = self.selected_point
+            current_session.is_open = True
+            current_session.start_time = datetime.now()
+            current_session.shift_type = self._determine_shift_type()
+            current_session.shift_label = (
+                f"{current_session.start_time.strftime('%d.%m.%Y %H:%M')}, "
+                f"{current_session.shift_type}"
+            )
+            
+            # Сохраняем токен если есть
+            if isinstance(login_result, dict):
+                if hasattr(current_session, 'token') and login_result.get("access_token"):
+                    current_session.token = login_result["access_token"]
+                if hasattr(current_session, 'warehouse_id') and login_result.get("warehouse_id"):
+                    current_session.warehouse_id = login_result["warehouse_id"]
+            
+            print(f"[HandoverDialog] ✓ Сессия создана:")
+            print(f"  Отдающий: {giver_faname}")
+            print(f"  Принимающий: {receiver_faname}")
+            print(f"  Точка: {self.selected_point}")
+            
+            self.accept()
         
         except Exception as e:
+            print(f"[HandoverDialog] ✗ Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(
                 self, "Ошибка",
-                f"Непредвиденная ошибка при создании сессии:\n\n{e}"
+                f"Ошибка создания сессии:\n\n{str(e)}"
             )
             self.status_label.setText("")
             self.start_btn.setEnabled(True)

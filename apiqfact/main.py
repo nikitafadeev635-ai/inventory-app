@@ -2155,14 +2155,11 @@ async def save_ref_state_detailed(req: RefStateDetailedRequest, request: Request
 #  🆕 ПРОВЕРКА БЛОКИРОВКИ ТОЧКИ (единственный эндпоинт для клиента)
 # ============================================================
 @app.post("/api/inventory/is-point-locked")
-async def is_point_locked_endpoint(
-    request: Request,
-    user: dict = Depends(get_current_user)
-):
+async def is_point_locked_endpoint(request: Request):
     """
     Проверяет заблокирована ли точка.
-    Клиент вызывает перед началом смены.
-    Разблокировка происходит ТОЛЬКО на сервере!
+    БЕЗ JWT — вызывается ДО авторизации в HandoverDialog.
+    Защищён middleware (HWID + Hash + API-Key).
     """
     try:
         data = await request.json()
@@ -2171,10 +2168,9 @@ async def is_point_locked_endpoint(
         if not point_name:
             raise HTTPException(400, "point_name required")
         
-        # Проверка что пользователь авторизован для этой точки
-        jwt_point = user.get("point_name")
-        if jwt_point != point_name:
-            raise HTTPException(403, "Point name mismatch")
+        # Проверяем что точка существует в системе
+        if point_name not in WAREHOUSE_IDS:
+            raise HTTPException(400, f"Unknown point: {point_name}")
         
         conn = None
         try:
@@ -2214,7 +2210,6 @@ async def is_point_locked_endpoint(
     except Exception as e:
         logger.error(f"[LockCheck] Exception: {e}")
         return {"locked": False, "error": str(e)}
-
 # ============================================================
 #  🆕 ПРИМЕНЕНИЕ НОРМАЛИЗАЦИИ С БЛОКИРОВКОЙ ТОЧКИ
 # ============================================================

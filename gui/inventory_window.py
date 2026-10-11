@@ -1182,7 +1182,7 @@ class InventoryWindow(QMainWindow):
         Принцип "Всё или ничего":
         1. Если БД не записалась после retry — НИЧЕГО больше не делаем
         2. Только после успешной записи в БД: SmartShell, Google Sheets, Telegram
-        3. Если SmartShell упал — блокируем точку до синхронизации
+        3. Если SmartShell упал — сервер блокирует точку до синхронизации
         """
         self._sync_actuals_from_table()
         
@@ -1344,6 +1344,7 @@ class InventoryWindow(QMainWindow):
             db_errors = []
             pdf_path = None
             ss_success = False
+            point_locked = False
             
             try:
                 # ============================================================
@@ -1561,7 +1562,7 @@ class InventoryWindow(QMainWindow):
                     print(f"[DB] ✗ Ошибка синхронизации товаров: {e}")
 
                 # ============================================================
-                #  ШАГ 7: ПРИМЕНЕНИЕ В SMARTSHELL
+                #  🆕 ШАГ 7: ПРИМЕНЕНИЕ В SMARTSHELL ЧЕРЕЗ СЕРВЕРНЫЙ ЭНДПОИНТ
                 # ============================================================
                 progress_dialog.hide()
                 QApplication.processEvents()
@@ -1577,111 +1578,57 @@ class InventoryWindow(QMainWindow):
                     self.close_btn.setText("🚀 Применение в SmartShell...")
                     QApplication.processEvents()
                     
-                    ss_result = service.apply_normalization_plan(plan, session_info)
+                    # 🆕 Вызываем СЕРВЕРНЫЙ эндпоинт, а не SmartShell напрямую!
+                    # Сервер применит операции и при ошибке заблокирует точку
+                    repo = InventoryRepository(self.client)
+                    ss_result = repo.apply_normalization(
+                        plan=plan,
+                        session_info=session_info,
+                        point_name=current_session.point_name,
+                        administrator=current_session.giver,
+                    )
+                    
                     ss_failed = ss_result.get("failed", 0)
-                    ss_success_count = ss_result.get("success", 0)
-                    ss_success = (ss_failed == 0)
+                    ss_success_count = ss_result.get("success_count", 0)
+                    ss_success = ss_result.get("success", False)
+                    point_locked = ss_result.get("locked", False)
+                    pending_id = ss_result.get("pending_id")
                     
                     if not ss_success:
-                        # 🚨 SMARTSHELL УПАЛ — СОХРАНЯЕМ PENDING И БЛОКИРУЕМ ТОЧКУ
-                        errors_text = "\n".join(str(e) for e in ss_result.get("errors", [])[:5])
-                        pending_id = None
+                        errors_list = ss_result.get("errors", [])
+                        # Преобразуем ошибки в строки для отображения
+                        errors_text = "\n".join(str(e) for e in errors_list[:5])
                         
-                        try:
-                            repo = InventoryRepository(self.client)
-                            
-                            # 1. Сохраняем pending операцию
-                            pending_result = repo.save_pending_smartshell_operation(
-                                plan=plan,
-                                session_info=session_info,
-                                error_details=errors_text,
-                                point_name=current_session.point_name,
-                                administrator=current_session.giver,
-                            )
-                            
-                            if pending_result.get("success"):
-                                pending_id = pending_result["id"]
-                                print(f"[SmartShell] ⚠ Операция сохранена (pending_id={pending_id})")
-                                
-                                # 2. 🔒 БЛОКИРУЕМ точку до синхронизации
-                                lock_reason = (
-                                    f"SmartShell не применил {ss_failed} операций из "
-                                    f"{len(plan.get('operations', []))}. "
-                                    f"Ожидание синхронизации (pending_id={pending_id}). "
-                                    f"Следующая инвентаризация на этой точке будет заблокирована "
-                                    f"до успешного применения операций."
-                                )
-                                
-                                lock_result = repo.lock_point_for_sync(
-                                    point_name=current_session.point_name,
-                                    reason=lock_reason,
-                                    pending_operation_id=pending_id
-                                )
-                                
-                                if lock_result.get("success"):
-                                    print(f"[Inventory] 🔒 Точка {current_session.point_name} "
-                                        f"заблокирована до синхронизации")
-                        
-                        except Exception as e:
-                            print(f"[Inventory] ✗ Ошибка сохранения pending/блокировки: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        
-                        # 3. Отправляем критический алерт в Telegram
-                        try:
-                            telegram = TelegramService()
-                            
-                            alert_message = (
-                                f"🚨 <b>SMARTSHELL НЕ ПРИМЕНИЛ ОПЕРАЦИИ!</b>\n\n"
-                                f"👤 <b>Админ:</b> {current_session.giver}\n"
-                                f"🏪 <b>Точка:</b> {current_session.point_name}\n"
-                                f"📦 <b>Операций:</b> {len(plan.get('operations', []))}\n"
-                                f"❌ <b>Ошибок:</b> {ss_failed}\n"
-                                f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
-                            )
-                            
-                            if pending_id:
-                                alert_message += f"🆔 <b>Pending ID:</b> {pending_id}\n"
-                            
-                            alert_message += (
-                                f"\n<b>Ошибки:</b>\n{errors_text}\n\n"
-                                f"✅ Данные сохранены в БД и Google Sheets\n"
-                                f"🔒 <b>Точка заблокирована</b> до синхронизации\n"
-                                f"⏳ Retry worker будет пытаться применить каждые 5 мин\n"
-                                f"🔄 После синхронизации точка разблокируется"
-                            )
-                            
-                            telegram.send_text_to_control_topic(alert_message)
-                            print(f"[Telegram] ✓ Критический алерт отправлен")
-                        except Exception as e:
-                            print(f"[Telegram] ✗ Не удалось отправить алерт: {e}")
-                        
-                        # 4. Показываем пользователю
-                        if ss_success_count == 0:
+                        if point_locked:
+                            # Сервер уже:
+                            # - Сохранил pending операцию
+                            # - Заблокировал точку
+                            # - Отправил алерт в Telegram
+                            # Клиент только показывает сообщение
                             QMessageBox.critical(
                                 self, "Ошибка SmartShell",
                                 f"⚠️ Не удалось применить изменения в SmartShell!\n\n"
                                 f"Успешно: {ss_success_count}\nОшибок: {ss_failed}\n\n"
-                                f"Ошибки:\n{errors_text}\n\n"
                                 f"✅ Данные сохранены в БД и Google Sheets\n"
                                 f"🔒 <b>Точка заблокирована</b> до синхронизации\n"
-                                f"⏳ Система попытается применить автоматически\n"
-                                f"📱 Руководитель уведомлён"
+                                f"⏳ Retry worker попытается применить автоматически\n"
+                                f"📱 Руководитель уведомлён через Telegram\n"
+                                f"🆔 Pending ID: {pending_id}"
                             )
                         else:
+                            # Ошибка без блокировки (например, валидация на сервере)
                             QMessageBox.warning(
-                                self, "Частичная ошибка SmartShell",
-                                f"⚠️ Не все операции применены в SmartShell:\n\n"
-                                f"Успешно: {ss_success_count}\nОшибок: {ss_failed}\n\n"
-                                f"✅ Данные сохранены в БД\n"
-                                f"🔒 <b>Точка заблокирована</b> до синхронизации\n"
-                                f"⏳ Retry worker попытается применить остаток"
+                                self, "Ошибка SmartShell",
+                                f"⚠️ Ошибка применения:\n\n{errors_text}\n\n"
+                                f"✅ Данные сохранены в БД"
                             )
                     else:
-                        print(f"[SmartShell] ✅ Все операции применены успешно")
+                        print(f"[SmartShell] ✅ Все операции применены успешно "
+                            f"({ss_success_count}/{len(plan.get('operations', []))})")
 
                     # ШАГ 8: АВТОМАТИЧЕСКАЯ ПОСТ-ВЕРИФИКАЦИЯ
-                    if ss_success:
+                    # Пропускаем при блокировке — верификация невозможна
+                    if ss_success and not point_locked:
                         self.close_btn.setText("🔍 Проверка применения...")
                         QApplication.processEvents()
                         verify_result = service.verify_application(plan)
@@ -2236,3 +2183,101 @@ class InventoryWindow(QMainWindow):
                     conn.close()
                 except:
                     pass
+
+    # ============================================================
+    #  🆕 ПРИМЕНЕНИЕ НОРМАЛИЗАЦИИ ЧЕРЕЗ СЕРВЕРНЫЙ ЭНДПОИНТ
+    # ============================================================
+    
+    def apply_normalization(self, plan: dict, session_info: dict,
+                            point_name: str, administrator: str) -> dict:
+        """
+        Вызывает серверный эндпоинт применения нормализации.
+        
+        Это заменяет прямое обращение к SmartShell API с клиента.
+        Сервер сам применит операции и при ошибке заблокирует точку.
+        
+        Returns:
+            dict: {
+                "success": bool,
+                "total": int,
+                "success_count": int,
+                "failed": int,
+                "errors": list,
+                "locked": bool,  # True если точка заблокирована
+                "pending_id": int,
+                "message": str
+            }
+        """
+        print(f"\n[InventoryRepository] 🚀 apply_normalization")
+        print(f"  point: {point_name}, admin: {administrator}")
+        print(f"  operations: {len(plan.get('operations', []))} шт")
+        
+        payload = {
+            "point_name": point_name,
+            "administrator": administrator,
+            "plan": plan,
+            "session_info": session_info,
+        }
+        
+        try:
+            response = self._post("/api/inventory/apply-normalization", payload)
+            if response is None:
+                return {
+                    "success": False,
+                    "total": len(plan.get("operations", [])),
+                    "success_count": 0,
+                    "failed": len(plan.get("operations", [])),
+                    "errors": ["No response from server"],
+                    "locked": False,
+                    "message": "No response"
+                }
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success"):
+                    print(f"[InventoryRepository] ✓ Успех: {data.get('success_count')}/{data.get('total')}")
+                else:
+                    print(f"[InventoryRepository] ⚠ Ошибка: {data.get('failed')} операций не применено")
+                    if data.get("locked"):
+                        print(f"[InventoryRepository] 🔒 Точка заблокирована")
+                return data
+            
+            elif response.status_code == 403:
+                error_msg = f"HTTP 403: {response.text[:200]}"
+                print(f"[InventoryRepository] ✗ Ошибка доступа: {error_msg}")
+                return {
+                    "success": False,
+                    "total": len(plan.get("operations", [])),
+                    "success_count": 0,
+                    "failed": len(plan.get("operations", [])),
+                    "errors": [error_msg],
+                    "locked": False,
+                    "message": "Access denied"
+                }
+            
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+                print(f"[InventoryRepository] ✗ Ошибка: {error_msg}")
+                return {
+                    "success": False,
+                    "total": len(plan.get("operations", [])),
+                    "success_count": 0,
+                    "failed": len(plan.get("operations", [])),
+                    "errors": [error_msg],
+                    "locked": False,
+                    "message": error_msg
+                }
+        
+        except Exception as e:
+            print(f"[InventoryRepository] ✗ Exception: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "total": len(plan.get("operations", [])),
+                "success_count": 0,
+                "failed": len(plan.get("operations", [])),
+                "errors": [str(e)],
+                "locked": False,
+                "message": str(e)
+            }
