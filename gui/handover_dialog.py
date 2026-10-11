@@ -19,7 +19,7 @@ from config import POINTS
 from core.api_client import ApiClient
 from gui.login_widget import LoginWidget
 from gui.styles import SmartShellColors
-
+from datetime import datetime 
 
 class HandoverDialog(QDialog):
     """
@@ -317,9 +317,24 @@ class HandoverDialog(QDialog):
                 self.status_label.setText("⏳ Выберите точку")
                 self.status_label.setStyleSheet("color: #fbbf24;")
     
+    def _determine_shift_type(self) -> str:
+        """
+        Определяет тип смены на основе текущего времени.
+        
+        Расписание:
+        - Первая смена: 08:00 - 19:59
+        - Вторая смена: 20:00 - 07:59
+        """
+        hour = datetime.now().hour
+        
+        if 8 <= hour <= 19:
+            return "Первая смена"
+        else:
+            return "Вторая смена"
     # ============================================================
     #  НАЧАЛО ПЕРЕСМЕНКИ
     # ============================================================
+
     def _on_start_clicked(self):
         """При клике 'Начать пересменку'."""
         print("\n[HandoverDialog] 🔥 НАЧАЛО ПЕРЕСМЕНКИ")
@@ -346,6 +361,44 @@ class HandoverDialog(QDialog):
             )
             return
         
+        # ============================================================
+        #  🆕 ПРОВЕРКА БЛОКИРОВКИ ТОЧКИ (перед логином)
+        # ============================================================
+        from core.inventory_repository import InventoryRepository
+        try:
+            repo = InventoryRepository(self.client)
+            lock_check = repo.is_point_locked(self.selected_point)
+            
+            if lock_check.get("locked"):
+                lock = lock_check["lock"]
+                locked_at = lock["locked_at"]
+                if hasattr(locked_at, "strftime"):
+                    locked_at_str = locked_at.strftime("%d.%m.%Y %H:%M")
+                else:
+                    locked_at_str = str(locked_at)
+                
+                QMessageBox.critical(
+                    self,
+                    "🔒 Точка заблокирована",
+                    f"⚠️ Точка <b>'{self.selected_point}'</b> заблокирована!\n\n"
+                    f"📋 <b>Причина:</b>\n{lock['reason']}\n\n"
+                    f"🕐 <b>Заблокирована:</b> {locked_at_str}\n\n"
+                    f"Это означает что предыдущая смена не завершилась корректно:\n"
+                    f"система SmartShell не синхронизирована с реальностью.\n\n"
+                    f"<b>Что делать:</b>\n"
+                    f"1. Свяжитесь с руководителем\n"
+                    f"2. Дождитесь синхронизации (обычно 5-30 минут)\n"
+                    f"3. Или примените операции вручную через SmartShell\n\n"
+                    f"После синхронизации блокировка будет снята автоматически."
+                )
+                return
+            
+            print(f"[HandoverDialog] ✓ Точка {self.selected_point} не заблокирована")
+            
+        except Exception as e:
+            # Если проверка упала — не блокируем пользователя
+            print(f"[HandoverDialog] ⚠ Не удалось проверить блокировку: {e}")
+        
         self.status_label.setText("⏳ Создание сессии...")
         self.status_label.setStyleSheet("color: #2C87FD;")
         self.start_btn.setEnabled(False)
@@ -357,7 +410,9 @@ class HandoverDialog(QDialog):
                 self.selected_point
             )
             
-            # Проверка результата
+            # ============================================================
+            #  ПРОВЕРКА РЕЗУЛЬТАТА (СОВМЕСТИМО со старым форматом)
+            # ============================================================
             login_failed = False
             error_msg = ""
             
@@ -368,25 +423,33 @@ class HandoverDialog(QDialog):
                 if "error" in login_result or "detail" in login_result:
                     login_failed = True
                     error_msg = login_result.get("error") or login_result.get("detail")
-                elif not login_result.get("access_token"):
+                elif not login_result.get("access_token") and not login_result.get("success"):
                     login_failed = True
                     error_msg = "Нет access_token в ответе"
             
             if login_failed:
                 QMessageBox.critical(
                     self, "Ошибка авторизации",
-                    f"Не удалось создать сессию.\n\n"
-                    f"Причина: {error_msg}"
+                    f"Не удалось создать сессию.\n\nПричина: {error_msg}"
                 )
+                self.status_label.setText("")
                 self.start_btn.setEnabled(True)
                 return
             
-            # Сохраняем данные сессии
+            # ============================================================
+            #  СОХРАНЕНИЕ ДАННЫХ СЕССИИ
+            # ============================================================
             from core.session import current_session
             current_session.giver = giver_faname
             current_session.receiver = receiver_faname
             current_session.point_name = self.selected_point
             current_session.is_open = True
+            current_session.start_time = datetime.now()
+            current_session.shift_type = self._determine_shift_type()
+            current_session.shift_label = (
+                f"{current_session.start_time.strftime('%d.%m.%Y %H:%M')}, "
+                f"{current_session.shift_type}"
+            )
             
             # Сохраняем токен если есть
             if isinstance(login_result, dict):
@@ -400,7 +463,7 @@ class HandoverDialog(QDialog):
             print(f"  Принимающий: {receiver_faname}")
             print(f"  Точка: {self.selected_point}")
             
-            self.accept()  # ← Только здесь закрываем диалог
+            self.accept()
         
         except Exception as e:
             print(f"[HandoverDialog] ✗ Ошибка: {e}")
@@ -410,8 +473,9 @@ class HandoverDialog(QDialog):
                 self, "Ошибка",
                 f"Ошибка создания сессии:\n\n{str(e)}"
             )
+            self.status_label.setText("")
             self.start_btn.setEnabled(True)
-    
+
     # ============================================================
     #  ПУБЛИЧНЫЕ МЕТОДЫ
     # ============================================================

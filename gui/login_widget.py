@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QLineEdit, QListWidget, QListWidgetItem, QGroupBox)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
-
+from gui.login_worker import VerifyPasswordWorker
 from core.api_client import ApiClient
 from gui.styles import SmartShellColors
 
@@ -223,7 +223,7 @@ class LoginWidget(QWidget):
     #  ВЕРИФИКАЦИЯ
     # ============================================================
     def _verify(self):
-        """Проверяет пароль через сервер (реальный запрос)."""
+        """Проверяет пароль через сервер (в фоновом потоке)."""
         if not self._selected_faname:
             self._set_status("⚠ Сначала выберите сотрудника", "#fbbf24")
             return
@@ -233,31 +233,46 @@ class LoginWidget(QWidget):
             self._set_status("⚠ Введите пароль", "#fbbf24")
             return
         
+        # Блокируем UI и показываем индикатор
         self._set_status("⏳ Проверка пароля...", "#2C87FD")
         self.password_input.setEnabled(False)
+        self.search_input.setEnabled(False)
         
-        try:
-            result = self.client.verify_password(self._selected_faname, password)
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import Qt
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+        # Запускаем проверку в фоновом потоке
+        self._verify_worker = VerifyPasswordWorker(
+            self.client, self._selected_faname, password
+        )
+        self._verify_worker.finished.connect(self._on_verify_finished)
+        self._verify_worker.start()
+
+
+    def _on_verify_finished(self, result):
+        """Обработчик завершения проверки пароля (вызывается в главном потоке)."""
+        from PyQt6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
+        
+        if result.get("verified"):
+            self._is_verified = True
+            self._set_status(f"✓ {self._selected_faname} верифицирован", "#10b981")
+            self.verified.emit(self._selected_faname, True)
             
-            if result.get("verified"):
-                self._is_verified = True
-                self._set_status(f"✓ {self._selected_faname} верифицирован", "#10b981")
-                self.verified.emit(self._selected_faname, True)
-                
-                # Делаем поля read-only после успешной верификации
-                self.search_input.setEnabled(False)
-                self.password_input.setEnabled(False)
-            else:
-                error = result.get("error", "Неверный пароль")
-                self._set_status(f"✗ {error}", "#ef4444")
-                self.verified.emit(self._selected_faname, False)
-                self.password_input.setEnabled(True)
-                self.password_input.clear()
-                self.password_input.setFocus()
-        
-        except Exception as e:
-            self._set_status(f"✗ Ошибка: {e}", "#ef4444")
+            # Делаем поля read-only после успешной верификации
+            self.search_input.setEnabled(False)
+            self.password_input.setEnabled(False)
+        else:
+            error = result.get("error", "Неверный пароль")
+            self._set_status(f"✗ {error}", "#ef4444")
+            self.verified.emit(self._selected_faname, False)
+            
+            # Разрешаем повторный ввод
+            self.search_input.setEnabled(True)
             self.password_input.setEnabled(True)
+            self.password_input.clear()
+            self.password_input.setFocus()
 
     # ============================================================
     #  ПУБЛИЧНЫЕ МЕТОДЫ

@@ -174,30 +174,75 @@ _ss_token_cache = {}
 _SS_TOKEN_TTL = 3600
 _smartshell_request_counter = 0
 
+
 # ============================================================
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ: Telegram
 # ============================================================
-async def send_telegram_alert(message: str):
-    """Критические уведомления в общий чат."""
+
+async def _send_to_telegram(payload: dict, context: str = "") -> bool:
+    """
+    🛡️ Универсальный хелпер отправки в Telegram с fallback.
+    
+    Если отправка в топик не удалась (TOPIC_CLOSED) — автоматически
+    отправляет в общий чат супергруппы. Это страхует от потери алертов.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("[Telegram] ⚠ Не настроен бот или chat_id — пропуск")
-        return
+        logger.warning(f"[Telegram] ⚠ Не настроен бот или chat_id ({context})")
+        return False
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
         async with httpx.AsyncClient(timeout=10) as client:
+            # Попытка 1: отправка с указанным топиком
             r = await client.post(url, json=payload)
+            
             if r.status_code == 200:
-                logger.info("[Telegram] ✓ Уведомление отправлено")
-            else:
-                logger.error(f"[Telegram] ✗ HTTP {r.status_code}: {r.text[:200]}")
+                topic_id = payload.get("message_thread_id", "—")
+                logger.info(f"[Telegram] ✓ {context} → топик {topic_id}")
+                return True
+            
+            # Попытка 2: если топик закрыт — пробуем без топика (fallback)
+            error_text = r.text.lower()
+            if "topic_closed" in error_text or "message thread not found" in error_text:
+                original_topic = payload.pop("message_thread_id", None)
+                logger.warning(
+                    f"[Telegram] ⚠ Топик {original_topic} закрыт, "
+                    f"fallback в общий чат ({context})"
+                )
+                r2 = await client.post(url, json=payload)
+                if r2.status_code == 200:
+                    logger.info(f"[Telegram] ✓ {context} → общий чат (fallback)")
+                    return True
+                else:
+                    logger.error(f"[Telegram] ✗ Fallback не удался: HTTP {r2.status_code}")
+                    return False
+            
+            # Другая ошибка
+            logger.error(f"[Telegram] ✗ {context}: HTTP {r.status_code} | {r.text[:200]}")
+            return False
+            
+    except httpx.TimeoutException:
+        logger.error(f"[Telegram] ✗ Timeout ({context})")
+        return False
     except Exception as e:
-        logger.error(f"[Telegram] ✗ Ошибка отправки: {e}")
+        logger.error(f"[Telegram] ✗ Ошибка {type(e).__name__}: {e} ({context})")
+        return False
+
+
+async def send_telegram_alert(message: str):
+    """Критические уведомления в контрольный топик (77897)."""
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    # 🆕 Используем контрольный топик если задан
+    if TELEGRAM_TOPIC_ID_CNTRL and TELEGRAM_TOPIC_ID_CNTRL > 0:
+        payload["message_thread_id"] = TELEGRAM_TOPIC_ID_CNTRL
+    
+    await _send_to_telegram(payload, context="Security Alert")
 
 
 async def send_telegram_to_topic(point_name: str, message: str, parse_mode: str = "HTML") -> dict:
@@ -209,36 +254,23 @@ async def send_telegram_to_topic(point_name: str, message: str, parse_mode: str 
     if not topic_id or topic_id <= 0:
         return {"success": False, "error": f"no valid topic_id for '{point_name}'"}
 
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "message_thread_id": topic_id,
-            "text": message,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(url, json=payload)
-            if r.status_code == 200:
-                data = r.json()
-                message_id = data.get("result", {}).get("message_id")
-                logger.info(
-                    f"[Telegram] ✓ Отчёт отправлен в топик '{point_name}' "
-                    f"(topic_id={topic_id}, message_id={message_id})"
-                )
-                return {"success": True, "message_id": message_id, "error": None}
-            return {"success": False, "error": f"HTTP {r.status_code}"}
-    except httpx.TimeoutException:
-        return {"success": False, "error": "timeout"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_thread_id": topic_id,
+        "text": message,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    
+    ok = await _send_to_telegram(payload, context=f"Topic '{point_name}'")
+    
+    if ok:
+        return {"success": True, "message_id": None, "error": None}
+    return {"success": False, "error": "Failed to send"}
 
 
 async def _send_blocked_ip_alert(ip: str, path: str, method: str):
     """Telegram-алерт о попытке доступа с неразрешённого IP."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
     now = time.time()
     _blocked_ip_tracker[ip] = [t for t in _blocked_ip_tracker[ip] if now - t < 300]
     if _blocked_ip_tracker[ip]:
@@ -253,14 +285,18 @@ async def _send_blocked_ip_alert(ip: str, path: str, method: str):
         f"<i>IP не в белом списке. Если это вы — добавьте IP в .env "
         f"(переменная ALLOWED_IPS или ADMIN_IPS)</i>"
     )
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            )
-    except Exception as e:
-        logger.error(f"[Security] ✗ Ошибка отправки алерта: {e}")
+    
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    # 🆕 ДОБАВЛЕНО: используем контрольный топик!
+    if TELEGRAM_TOPIC_ID_CNTRL and TELEGRAM_TOPIC_ID_CNTRL > 0:
+        payload["message_thread_id"] = TELEGRAM_TOPIC_ID_CNTRL
+    
+    await _send_to_telegram(payload, context=f"Blocked IP {ip}")
 
 
 async def send_normalize_control_log(
@@ -276,11 +312,7 @@ async def send_normalize_control_log(
     add_count: int = 0,
     failed_count: int = 0,
 ):
-    """
-    Отправляет лог операции нормализации в контрольный топик CyberMG.
-    Компактный формат без лишних разделителей.
-    """
-    # Диагностика early returns
+    """Отправляет лог операции нормализации в контрольный топик CyberMG."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("[Telegram] ⚠ Control log: bot/chat_id not configured")
         return
@@ -311,7 +343,6 @@ async def send_normalize_control_log(
     else:
         status_text = "✅ Успешно"
 
-    # Компактное сообщение без разделителей
     message = (
         f"👤 <b>Админ:</b> {faname}\n"
         f"🏪 <b>Точка:</b> {point_name}\n"
@@ -329,25 +360,15 @@ async def send_normalize_control_log(
         f"{status_text}"
     )
 
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "message_thread_id": TELEGRAM_TOPIC_ID_CNTRL,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json=payload)
-            if r.status_code == 200:
-                logger.info(f"[Telegram] ✓ Control log sent to topic {TELEGRAM_TOPIC_ID_CNTRL}")
-            else:
-                logger.error(f"[Telegram] ✗ Control log failed: HTTP {r.status_code} | Body: {r.text[:500]}")
-    except httpx.TimeoutException:
-        logger.error(f"[Telegram] ✗ Control log timeout (10s)")
-    except Exception as e:
-        logger.error(f"[Telegram] ✗ Control log error: {type(e).__name__}: {e}")
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_thread_id": TELEGRAM_TOPIC_ID_CNTRL,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    
+    await _send_to_telegram(payload, context=f"Control log {point_name}")
 
 
 # ============================================================
@@ -488,6 +509,163 @@ def log_audit(data: dict):
             conn.commit()
     except Exception as e:
         logger.error(f"Audit log error: {e}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+# ============================================================
+#  🆕 СЕРВЕРНЫЕ ФУНКЦИИ БЛОКИРОВКИ ТОЧЕК (не эндпоинты!)
+# ============================================================
+
+def _lock_point_on_server(point_name: str, reason: str, pending_operation_id: int = None) -> dict:
+    """Блокирует точку. Вызывается ТОЛЬКО сервером при ошибке применения."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO point_locks
+                (point_name, locked_at, locked_by, reason, pending_operation_id)
+                VALUES (%s, NOW(), 'server', %s, %s)""",
+                (point_name, reason, pending_operation_id)
+            )
+            conn.commit()
+            lock_id = cur.lastrowid
+            logger.info(f"[Lock] 🔒 Точка {point_name} заблокирована (lock_id={lock_id})")
+            return {"success": True, "lock_id": lock_id}
+    except Exception as e:
+        logger.error(f"[Lock] ✗ Ошибка блокировки: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+def _unlock_point_by_pending_id_on_server(pending_operation_id: int) -> dict:
+    """Разблокирует точку по pending_id. Вызывается ТОЛЬКО сервером."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE point_locks
+                SET resolved_at = NOW()
+                WHERE pending_operation_id = %s AND resolved_at IS NULL""",
+                (pending_operation_id,)
+            )
+            affected = cur.rowcount
+            conn.commit()
+            if affected > 0:
+                logger.info(f"[Lock] 🔓 Точка разблокирована (pending_id={pending_operation_id})")
+            return {"success": True, "unlocked": affected}
+    except Exception as e:
+        logger.error(f"[Lock] ✗ Ошибка разблокировки: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+def _save_pending_operation_on_server(plan: dict, session_info: dict, error_details: str,
+                                       point_name: str, administrator: str) -> dict:
+    """Сохраняет pending операцию. Вызывается ТОЛЬКО сервером."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pending_smartshell_operations
+                (point_name, administrator, plan_json, session_info_json,
+                 error_details, created_at, retry_count, last_attempt, status)
+                VALUES (%s, %s, %s, %s, %s, NOW(), 0, NULL, 'pending')""",
+                (
+                    point_name,
+                    administrator,
+                    json.dumps(plan, ensure_ascii=False),
+                    json.dumps(session_info, ensure_ascii=False),
+                    error_details,
+                ),
+            )
+            conn.commit()
+            new_id = cur.lastrowid
+            logger.info(f"[Pending] ✓ Сохранена операция (id={new_id})")
+            return {"success": True, "id": new_id}
+    except Exception as e:
+        logger.error(f"[Pending] ✗ Ошибка сохранения: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+def _get_pending_operations_on_server(limit: int = 10) -> list:
+    """Получает pending операции. Вызывается ТОЛЬКО серверным процессом."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT * FROM pending_smartshell_operations
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT %s""",
+                (limit,)
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"[Pending] ✗ Ошибка получения: {e}")
+        return []
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+def _mark_operation_status_on_server(operation_id: int, status: str, reason: str = None) -> dict:
+    """Отмечает статус операции. Вызывается ТОЛЬКО серверным процессом."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if status == "success":
+                cur.execute(
+                    """UPDATE pending_smartshell_operations
+                    SET status = 'success', completed_at = NOW()
+                    WHERE id = %s""",
+                    (operation_id,)
+                )
+            elif status == "failed":
+                cur.execute(
+                    """UPDATE pending_smartshell_operations
+                    SET status = 'failed', error_details = %s, completed_at = NOW()
+                    WHERE id = %s""",
+                    (reason, operation_id)
+                )
+            elif status == "increment":
+                cur.execute(
+                    """UPDATE pending_smartshell_operations
+                    SET retry_count = retry_count + 1, last_attempt = NOW()
+                    WHERE id = %s""",
+                    (operation_id,)
+                )
+            conn.commit()
+            return {"success": True}
+    except Exception as e:
+        logger.error(f"[Pending] ✗ Ошибка обновления статуса: {e}")
+        return {"success": False, "error": str(e)}
     finally:
         if conn:
             try:
@@ -813,6 +991,10 @@ async def hwid_hash_verification_middleware(request: Request, call_next):
 
     # Пропускаем админские эндпоинты (у них своя защита)
     if path.startswith("/api/admin/"):
+        return await call_next(request)
+
+    # 🆕 Пропускаем проверку блокировки (вызывается ДО логина)
+    if path == "/api/inventory/is-point-locked":
         return await call_next(request)
 
     # Проверяем наличие заголовков
@@ -1973,6 +2155,237 @@ async def save_ref_state_detailed(req: RefStateDetailedRequest, request: Request
             except:
                 pass
 
+# ============================================================
+#  🆕 ПРОВЕРКА БЛОКИРОВКИ ТОЧКИ (единственный эндпоинт для клиента)
+# ============================================================
+@app.post("/api/inventory/is-point-locked")
+async def is_point_locked_endpoint(request: Request):
+    """
+    Проверяет заблокирована ли точка.
+    
+    БЕЗ JWT — вызывается ДО авторизации в HandoverDialog.
+    Защищён middleware (HWID + Hash + API-Key).
+    """
+    try:
+        data = await request.json()
+        point_name = data.get("point_name")
+        
+        if not point_name:
+            raise HTTPException(400, "point_name required")
+        
+        # 🛡️ Проверяем что точка существует в системе
+        if point_name not in WAREHOUSE_IDS:
+            raise HTTPException(400, f"Unknown point: {point_name}")
+        
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM point_locks
+                    WHERE point_name = %s AND resolved_at IS NULL
+                    ORDER BY locked_at DESC
+                    LIMIT 1""",
+                    (point_name,)
+                )
+                lock = cur.fetchone()
+                
+                if lock:
+                    return {
+                        "locked": True,
+                        "lock": {
+                            "id": lock["id"],
+                            "point_name": lock["point_name"],
+                            "locked_at": lock["locked_at"].isoformat() if lock["locked_at"] else None,
+                            "locked_by": lock["locked_by"],
+                            "reason": lock["reason"],
+                            "pending_operation_id": lock["pending_operation_id"],
+                        },
+                        "reason": lock.get("reason", "")
+                    }
+                return {"locked": False}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[LockCheck] Exception: {e}")
+        return {"locked": False, "error": str(e)}
+
+# ============================================================
+#  🆕 ПРИМЕНЕНИЕ НОРМАЛИЗАЦИИ С БЛОКИРОВКОЙ ТОЧКИ
+# ============================================================
+
+class ApplyNormalizationRequest(BaseModel):
+    """Запрос на применение нормализации в SmartShell."""
+    point_name: str
+    administrator: str
+    plan: dict
+    session_info: dict
+
+
+@app.post("/api/inventory/apply-normalization")
+async def apply_normalization_endpoint(
+    req: ApplyNormalizationRequest,
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Применяет план нормализации в SmartShell с защитой от частичного применения.
+    
+    Если применение провалилось:
+    1. Сохраняет операцию в pending
+    2. Блокирует точку до синхронизации
+    3. Отправляет критический алерт в Telegram
+    """
+    # Проверка JWT
+    jwt_faname = user.get("faname")
+    if jwt_faname != req.administrator:
+        logger.warning(f"[Security] FANAME MISMATCH в NORMALIZATION: {jwt_faname} vs {req.administrator}")
+        raise HTTPException(403, "Administrator mismatch")
+    
+    jwt_point = user.get("point_name")
+    if jwt_point != req.point_name:
+        logger.warning(f"[Security] POINT MISMATCH в NORMALIZATION: {jwt_point} vs {req.point_name}")
+        raise HTTPException(403, "Point name mismatch")
+    
+    logger.info(f"[Normalization] 🚀 Применение плана: {req.point_name}, {req.administrator}")
+    
+    try:
+        warehouse_id = WAREHOUSE_IDS.get(req.point_name)
+        if not warehouse_id:
+            raise HTTPException(400, f"Unknown point: {req.point_name}")
+        
+        operations = req.plan.get("operations", [])
+        disposals = [op for op in operations if op.get("type") == "DISPOSAL"]
+        additions = [op for op in operations if op.get("type") == "ADD"]
+        
+        def _format_items(ops):
+            items = []
+            for op in ops:
+                items.append({
+                    "id": op.get("product_id"),
+                    "quantity": op.get("quantity", 1),
+                    "title": op.get("product_title", ""),
+                })
+            return items
+        
+        total_success = 0
+        total_failed = 0
+        all_errors = []
+        
+        # Применяем DISPOSAL
+        if disposals:
+            disposal_items = _format_items(disposals)
+            ss_result = await change_quantity_ss(warehouse_id, disposal_items, "DISPOSAL")
+            total_success += ss_result.get("successful_items", 0)
+            total_failed += ss_result.get("failed_items", 0)
+            all_errors.extend(ss_result.get("errors", []))
+        
+        # Применяем ADD
+        if additions:
+            addition_items = _format_items(additions)
+            ss_result = await change_quantity_ss(warehouse_id, addition_items, "ADD")
+            total_success += ss_result.get("successful_items", 0)
+            total_failed += ss_result.get("failed_items", 0)
+            all_errors.extend(ss_result.get("errors", []))
+        
+        # Проверяем результат
+        if total_failed > 0:
+            # 🚨 ОШИБКА — СОХРАНЯЕМ И БЛОКИРУЕМ
+            errors_text = json.dumps(all_errors[:5], ensure_ascii=False)
+            
+            pending_result = _save_pending_operation_on_server(
+                plan=req.plan,
+                session_info=req.session_info,
+                error_details=errors_text,
+                point_name=req.point_name,
+                administrator=req.administrator,
+            )
+            
+            pending_id = pending_result.get("id") if pending_result.get("success") else None
+            
+            lock_reason = (
+                f"SmartShell не применил {total_failed} операций из {len(operations)}. "
+                f"Ожидание синхронизации (pending_id={pending_id})."
+            )
+            
+            _lock_point_on_server(
+                point_name=req.point_name,
+                reason=lock_reason,
+                pending_operation_id=pending_id
+            )
+            
+            asyncio.create_task(send_telegram_alert(
+                f"🚨 <b>SMARTSHELL НЕ ПРИМЕНИЛ ОПЕРАЦИИ!</b>\n"
+                f"👤 Админ: {req.administrator}\n"
+                f"🏪 Точка: {req.point_name}\n"
+                f"📦 Операций: {len(operations)}, Ошибок: {total_failed}\n"
+                f"🔒 Точка заблокирована до синхронизации"
+            ))
+            
+            return {
+                "success": False,
+                "total": len(operations),
+                "success_count": total_success,
+                "failed": total_failed,
+                "errors": all_errors[:5],
+                "locked": True,
+                "pending_id": pending_id,
+                "message": "Точка заблокирована до синхронизации"
+            }
+        
+        # ✅ УСПЕХ
+        logger.info(f"[Normalization] ✅ Все операции применены: {total_success}/{len(operations)}")
+        
+        return {
+            "success": True,
+            "total": len(operations),
+            "success_count": total_success,
+            "failed": 0,
+            "locked": False,
+            "message": "Все операции применены успешно"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Normalization] ✗ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        errors_text = str(e)
+        
+        pending_result = _save_pending_operation_on_server(
+            plan=req.plan,
+            session_info=req.session_info,
+            error_details=errors_text,
+            point_name=req.point_name,
+            administrator=req.administrator,
+        )
+        
+        pending_id = pending_result.get("id") if pending_result.get("success") else None
+        
+        _lock_point_on_server(
+            point_name=req.point_name,
+            reason=f"Ошибка применения: {errors_text} (pending_id={pending_id})",
+            pending_operation_id=pending_id
+        )
+        
+        return {
+            "success": False,
+            "total": len(req.plan.get("operations", [])),
+            "success_count": 0,
+            "failed": len(req.plan.get("operations", [])),
+            "errors": [errors_text],
+            "locked": True,
+            "pending_id": pending_id,
+            "message": "Критическая ошибка применения"
+        }
 # ============================================================
 #  TELEGRAM PDF
 # ============================================================

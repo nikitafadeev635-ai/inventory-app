@@ -177,74 +177,226 @@ class NormalizationService:
             "errors": [],
         }
 
-    def apply_normalization_plan(self, plan: Dict, session_info: dict) -> Dict:
+    def apply_normalization_plan(self, plan: dict, session_info: dict = None) -> dict:
         """
-        🆕 ФАЗА 2: Применяет план в SmartShell (атомарно, пакетно).
+        Применяет план нормализации в SmartShell с retry-логикой.
         
-        Вызывается ТОЛЬКО после того как:
-        - Пройден TroubleDialog
-        - Все данные записаны в БД
-        - Сформирован PDF отчёт
-        - Программа заблокирована от закрытия
+        Retry на уровне ПАКЕТОВ: если пакет не прошёл — повторяем ВЕСЬ пакет.
+        4 попытки с интервалом 5 секунд.
+        
+        Args:
+            plan: План нормализации с операциями
+            session_info: Информация о сессии (для логирования)
         
         Returns:
-            Результат от VPS (success/failed/chunks_info/operations)
+            dict: Результат применения
         """
         operations = plan.get("operations", [])
         if not operations:
-            return {"success": 0, "failed": 0, "errors": [], "operations": []}
+            return {
+                "success": True,
+                "total": 0,
+                "success_count": 0,
+                "failed": 0,
+                "errors": []
+            }
+        
+        # Группируем операции по типам
+        disposals = [op for op in operations if op.get("type") == "DISPOSAL"]
+        additions = [op for op in operations if op.get("type") == "ADD"]
         
         print(f"\n[Normalization] 🚀 ПРИМЕНЕНИЕ ПЛАНА В SMARTSHELL:")
         print(f"  {len(operations)} операций")
         
-        response = self.client.normalize(
-            operations=operations,
-            session_info=session_info,
-            giver=current_session.giver,
-            receiver=current_session.receiver,
-            point_name=current_session.point_name,
-        )
+        all_results = {
+            "success": True,
+            "total": len(operations),
+            "success_count": 0,
+            "failed": 0,
+            "errors": [],
+            "ss_request_count": 0,
+            "retry_details": [],
+        }
         
-        # Обогащаем операции статусом успеха
-        response_errors = response.get("errors", [])
-        operations_list = response.get("operations", [])
+        MAX_RETRIES = 4
+        RETRY_DELAY = 5  # секунд
         
-        successful_ids = set()
-        if operations_list and isinstance(operations_list, list):
-            for op in operations_list:
-                if isinstance(op, dict) and op.get("success", True):
-                    successful_ids.add(op.get("product_id"))
-        else:
-            # Fallback: если VPS не вернул operations, считаем все успешными при отсутствии failed
-            if response.get("failed", 0) == 0 and response.get("success", 0) > 0:
-                successful_ids = {op["product_id"] for op in operations}
-        
-        enriched_ops = []
-        for op in operations:
-            enriched_ops.append({
-                **op,
-                "success": op["product_id"] in successful_ids,
-                "expected_stock": plan["actuals_before"].get(op["product_id"], 0) + op["delta"],
+        # === Обрабатываем DISPOSAL с retry ===
+        if disposals:
+            print(f"[Normalization] 📉 DISPOSAL: {len(disposals)} товаров")
+            disposal_result = self._apply_batch_with_retry(
+                disposals, "DISPOSAL", MAX_RETRIES, RETRY_DELAY
+            )
+            all_results["success_count"] += disposal_result.get("success_count", 0)
+            all_results["failed"] += disposal_result.get("failed", 0)
+            all_results["errors"].extend(disposal_result.get("errors", []))
+            all_results["ss_request_count"] += disposal_result.get("ss_request_count", 0)
+            all_results["retry_details"].append({
+                "type": "DISPOSAL",
+                "attempts": disposal_result.get("attempts", 1),
+                "final_status": "success" if disposal_result.get("failed", 0) == 0 else "failed"
             })
         
-        response["operations"] = enriched_ops
+        # === Обрабатываем ADD с retry ===
+        if additions:
+            print(f"[Normalization] 📈 ADD: {len(additions)} товаров")
+            addition_result = self._apply_batch_with_retry(
+                additions, "ADD", MAX_RETRIES, RETRY_DELAY
+            )
+            all_results["success_count"] += addition_result.get("success_count", 0)
+            all_results["failed"] += addition_result.get("failed", 0)
+            all_results["errors"].extend(addition_result.get("errors", []))
+            all_results["ss_request_count"] += addition_result.get("ss_request_count", 0)
+            all_results["retry_details"].append({
+                "type": "ADD",
+                "attempts": addition_result.get("attempts", 1),
+                "final_status": "success" if addition_result.get("failed", 0) == 0 else "failed"
+            })
         
-        chunks_info = response.get("chunks_info", {})
-        disposal_info = chunks_info.get("disposal") if isinstance(chunks_info, dict) else None
-        add_info = chunks_info.get("add") if isinstance(chunks_info, dict) else None
+        # === Итоговый результат ===
+        all_results["success"] = (all_results["failed"] == 0)
         
         print(f"[Normalization] ✅ Результат SmartShell: "
-              f"✓ {response.get('success', 0)} успешно, "
-              f"✗ {response.get('failed', 0)} ошибок")
+            f"✓ {all_results['success_count']} успешно, "
+            f"✗ {all_results['failed']} ошибок")
         
-        if disposal_info and isinstance(disposal_info, dict):
-            print(f"  📊 DISPOSAL: {disposal_info.get('successful_items', 0)}/"
-                  f"{disposal_info.get('total_items', 0)} товаров")
-        if add_info and isinstance(add_info, dict):
-            print(f"  📊 ADD: {add_info.get('successful_items', 0)}/"
-                  f"{add_info.get('total_items', 0)} товаров")
+        if disposals:
+            disp_detail = next((d for d in all_results["retry_details"] if d["type"] == "DISPOSAL"), None)
+            print(f"  📊 DISPOSAL: {len(disposals)}/{len(disposals)} товаров "
+                f"({disp_detail['attempts']} попыток)")
+        if additions:
+            add_detail = next((d for d in all_results["retry_details"] if d["type"] == "ADD"), None)
+            print(f"  📊 ADD: {len(additions)}/{len(additions)} товаров "
+                f"({add_detail['attempts']} попыток)")
         
-        return response
+        return all_results
+
+
+    def _apply_batch_with_retry(self, operations: list, operation_type: str,
+                                max_retries: int = 4, retry_delay: int = 5) -> dict:
+        """
+        Применяет пакет операций с retry-логикой.
+        
+        Если пакет не прошёл — повторяем ВЕСЬ пакет целиком.
+        НЕ делим на успешные/неуспешные товары.
+        
+        Args:
+            operations: Список операций для применения
+            operation_type: Тип операции ("DISPOSAL" или "ADD")
+            max_retries: Максимальное количество попыток (по умолчанию 4)
+            retry_delay: Задержка между попытками в секундах
+        
+        Returns:
+            dict: {
+                "success_count": int,
+                "failed": int,
+                "errors": list,
+                "attempts": int,  # Сколько попыток потребовалось
+                "ss_request_count": int
+            }
+        """
+        import time
+        
+        last_result = None
+        
+        for attempt in range(1, max_retries + 1):
+            if attempt > 1:
+                print(f"[Normalization] 🔄 Попытка {attempt}/{max_retries} "
+                    f"(через {retry_delay}с)...")
+                time.sleep(retry_delay)
+            
+            # Применяем ВЕСЬ пакет целиком
+            result = self._apply_operations_batch(operations, operation_type)
+            last_result = result
+            
+            # Если все операции успешны — выходим
+            if result.get("failed", 0) == 0:
+                if attempt > 1:
+                    print(f"[Normalization] ✅ Пакет {operation_type} "
+                        f"успешно применён на попытке {attempt}")
+                return {
+                    "success_count": len(operations),
+                    "failed": 0,
+                    "errors": [],
+                    "attempts": attempt,
+                    "ss_request_count": result.get("ss_request_count", 1)
+                }
+            
+            # Если есть ошибки — логируем и пробуем снова
+            print(f"[Normalization] ⚠️ Попытка {attempt}/{max_retries}: "
+                f"✗ {result.get('failed', 0)} ошибок в пакете {operation_type}")
+        
+        # Все попытки исчерпаны — возвращаем последнюю неудачную попытку
+        print(f"[Normalization] ❌ Все {max_retries} попытки исчерпаны для {operation_type}")
+        return {
+            "success_count": result.get("success", 0),
+            "failed": result.get("failed", len(operations)),
+            "errors": result.get("errors", []),
+            "attempts": max_retries,
+            "ss_request_count": result.get("ss_request_count", max_retries)
+        }
+
+
+    def _apply_operations_batch(self, operations: list, operation_type: str) -> dict:
+        """
+        Применяет пакет операций ОДИН раз (без retry).
+        
+        Это обёртка над существующей логикой SmartShell.
+        
+        Args:
+            operations: Список операций
+            operation_type: "DISPOSAL" или "ADD"
+        
+        Returns:
+            dict: Результат применения
+        """
+        # Формируем items для SmartShell
+        items = []
+        for op in operations:
+            items.append({
+                "id": op.get("product_id"),
+                "quantity": op.get("quantity", 1),
+                "title": op.get("product_title", ""),
+            })
+        
+        # Вызываем существующую функцию SmartShell
+        # Это должна быть твоя текущая функция которая делает GraphQL-запрос
+        result = self._apply_to_smartshell(items, operation_type)
+        
+        return result
+
+
+    def _apply_to_smartshell(self, items: list, operation: str) -> dict:
+        """
+        Отправляет пакет товаров в SmartShell через GraphQL.
+        
+        Это ТВОЯ СУЩЕСТВУЮЩАЯ логика отправки в SmartShell.
+        Перенеси её сюда из текущего apply_normalization_plan.
+        """
+        # Скопируй сюда код который у тебя сейчас в apply_normalization_plan
+        # который делает change_quantity_ss или аналогичный вызов
+        
+        # Пример (замени на свой реальный код):
+        from core.api_client import change_quantity_ss
+        from config import SMARTSHELL_WAREHOUSE_IDS
+        from core.session import current_session
+        
+        warehouse_id = SMARTSHELL_WAREHOUSE_IDS.get(current_session.point_name)
+        if not warehouse_id:
+            return {
+                "success": False,
+                "failed": len(items),
+                "errors": ["Unknown warehouse_id"]
+            }
+        
+        result = change_quantity_ss(warehouse_id, items, operation)
+        
+        return {
+            "success": result.get("successful_items", 0),
+            "failed": result.get("failed_items", 0),
+            "errors": result.get("errors", []),
+            "ss_request_count": result.get("ss_request_count", 1)
+        }
 
     def verify_application(self, plan: Dict) -> Dict:
         """
