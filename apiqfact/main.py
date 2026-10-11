@@ -2158,6 +2158,7 @@ async def save_ref_state_detailed(req: RefStateDetailedRequest, request: Request
 async def is_point_locked_endpoint(request: Request):
     """
     Проверяет заблокирована ли точка.
+    
     БЕЗ JWT — вызывается ДО авторизации в HandoverDialog.
     Защищён middleware (HWID + Hash + API-Key).
     """
@@ -2168,7 +2169,7 @@ async def is_point_locked_endpoint(request: Request):
         if not point_name:
             raise HTTPException(400, "point_name required")
         
-        # Проверяем что точка существует в системе
+        # 🛡️ Проверяем что точка существует в системе
         if point_name not in WAREHOUSE_IDS:
             raise HTTPException(400, f"Unknown point: {point_name}")
         
