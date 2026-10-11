@@ -19,7 +19,7 @@ from config import POINTS
 from core.api_client import ApiClient
 from gui.login_widget import LoginWidget
 from gui.styles import SmartShellColors
-
+from datetime import datetime 
 
 class HandoverDialog(QDialog):
     """
@@ -317,6 +317,20 @@ class HandoverDialog(QDialog):
                 self.status_label.setText("⏳ Выберите точку")
                 self.status_label.setStyleSheet("color: #fbbf24;")
     
+    def _determine_shift_type(self) -> str:
+        """
+        Определяет тип смены на основе текущего времени.
+        
+        Расписание:
+        - Первая смена: 08:00 - 19:59
+        - Вторая смена: 20:00 - 07:59
+        """
+        hour = datetime.now().hour
+        
+        if 8 <= hour <= 19:
+            return "Первая смена"
+        else:
+            return "Вторая смена"
     # ============================================================
     #  НАЧАЛО ПЕРЕСМЕНКИ
     # ============================================================

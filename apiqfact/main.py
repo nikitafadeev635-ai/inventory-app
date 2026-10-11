@@ -993,6 +993,10 @@ async def hwid_hash_verification_middleware(request: Request, call_next):
     if path.startswith("/api/admin/"):
         return await call_next(request)
 
+    # 🆕 Пропускаем проверку блокировки (вызывается ДО логина)
+    if path == "/api/inventory/is-point-locked":
+        return await call_next(request)
+
     # Проверяем наличие заголовков
     client_hash = request.headers.get("X-Client-Hash", "")
     client_hwid = request.headers.get("X-Client-HWID", "")
@@ -2211,6 +2215,7 @@ async def is_point_locked_endpoint(request: Request):
     except Exception as e:
         logger.error(f"[LockCheck] Exception: {e}")
         return {"locked": False, "error": str(e)}
+
 # ============================================================
 #  🆕 ПРИМЕНЕНИЕ НОРМАЛИЗАЦИИ С БЛОКИРОВКОЙ ТОЧКИ
 # ============================================================

@@ -1,6 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Скрипт сборки inventory_app.exe
-
 import sys
 from pathlib import Path
 
@@ -11,36 +9,96 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        # Встраиваем в .exe только внутренние ресурсы
-        ('image', 'image'),           # Картинки (если используются внутри кода)
-        ('gui/styles.py', 'gui'),     # Стили (импортируются)
+        ('image', 'image'),
+        ('gui/styles.py', 'gui'),
     ],
     hiddenimports=[
+        # === HTTP / API ===
         'httpx',
+        'httpx._transports.default',
+        'h2',
+        'hpack',
+        'hyperframe',
+        
+        # === 🆕 ЛОКАЛЬНЫЙ SYNC SERVER (FastAPI на клиенте!) ===
         'fastapi',
         'uvicorn',
-        'qrcode',
-        'reportlab',
-        'dotenv',
+        'uvicorn.logging',
+        'uvicorn.loops',
+        'uvicorn.loops.auto',
+        'uvicorn.protocols',
+        'uvicorn.protocols.http',
+        'uvicorn.protocols.http.auto',
+        'uvicorn.protocols.websockets',
+        'uvicorn.protocols.websockets.auto',
+        'uvicorn.lifespan',
+        'uvicorn.lifespan.on',
+        'uvicorn.lifespan.off',
+        'starlette',
+        'starlette.middleware',
+        'starlette.middleware.cors',
+        'websockets',
+        'pydantic',
+        'anyio',
+        'anyio._backends',
+        'anyio._backends._asyncio',
+        
+        # === GUI ===
         'PyQt6',
         'PyQt6.QtWidgets',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
         'PyQt6.QtSvg',
+        'PyQt6.QtNetwork',
+        
+        # === БД ===
+        'pymysql',
+        
+        # === Отчёты ===
+        'reportlab',
+        'reportlab.lib',
+        'reportlab.platypus',
+        'reportlab.pdfgen',
+        
+        # === QR-коды ===
+        'qrcode',
+        'qrcode.image',
+        'qrcode.image.pil',
+        'PIL',
+        'PIL.Image',
+        
+        # === Конфиги ===
+        'dotenv',
+        
+        # === Криптография ===
+        'jwt',
+        'cryptography',
+        'cryptography.hazmat',
+        'cryptography.hazmat.primitives',
+        
+        # === 🆕 НОВЫЕ МОДУЛИ ===
+        'core.google_sheets_client_sync',
+        'gui.login_worker',
+        
+        # === Другие ===
         'sqlalchemy',
         'mysql.connector',
-        'pymysql',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'matplotlib',      # Не используется
-        'numpy',           # Может не использоваться
+        # Тяжёлые зависимости которые ТОЧНО не используются
+        'matplotlib',
+        'numpy',
         'scipy',
         'pandas',
         'tkinter',
         'pytest',
+        'IPython',
+        'jupyter',
+        'notebook',
+        'sphinx',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -64,11 +122,11 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,   # 🚫 Без консольного окна (GUI-приложение)
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,       # Можно добавить иконку: icon='icon.ico'
+    icon=None,
 )
