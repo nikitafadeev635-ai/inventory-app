@@ -1,5 +1,6 @@
 """
 Сервис отправки уведомлений в Telegram.
+
 Поддерживает:
 - Текстовые сообщения (send-ref-state)
 - PDF-документы с подписью (send-ref-state-with-pdf)
@@ -9,14 +10,40 @@ import os
 from pathlib import Path
 from config import PROXY_SERVER_URL, API_SECRET_KEY
 
+# 🆕 Импорт для HWID и Hash
+try:
+    from core.integrity_checker import get_exe_hash, get_hardware_id
+    _INTEGRITY_AVAILABLE = True
+except ImportError:
+    _INTEGRITY_AVAILABLE = False
+    get_exe_hash = lambda: ""
+    get_hardware_id = lambda: ""
+
 
 class TelegramService:
     def __init__(self):
         self.base_url = f"{PROXY_SERVER_URL}/api/telegram"
+        
+        # 🆕 Вычисляем HWID и Hash один раз
+        self._client_hash = ""
+        self._client_hwid = ""
+        if _INTEGRITY_AVAILABLE:
+            try:
+                self._client_hash = get_exe_hash() or ""
+                self._client_hwid = get_hardware_id() or ""
+            except Exception as e:
+                print(f"[Telegram] ⚠ Ошибка HWID/Hash: {e}")
+        
+        # 🆕 Базовые заголовки с HWID/Hash
         self.headers_base = {
             "X-API-Key": API_SECRET_KEY,
         }
-    
+        
+        if self._client_hash:
+            self.headers_base["X-Client-Hash"] = self._client_hash
+        if self._client_hwid:
+            self.headers_base["X-Client-HWID"] = self._client_hwid
+
     def send_ref_state_report(
         self,
         point_name: str,
@@ -28,35 +55,27 @@ class TelegramService:
         items_on_check: int,
         references: list,
         pdf_path: str = None,
-        check_value: float = 0.0,     # 🆕 сумма товаров на проверке
-        pay_value: float = 0.0,       # 🆕 к возмещению
-        all_ref: list = None,         # 🆕 детали ссылок
+        check_value: float = 0.0,
+        pay_value: float = 0.0,
+        all_ref: list = None,
     ) -> dict:
-        """
-        Отправляет отчёт с финансовой разбивкой:
-        - Предварительный минус (total_value)
-        - Товары на проверке (check_value)
-        - К возмещению (pay_value)
-        """
-        # 🆕 Формируем текст СТРОГО ПО ШАБЛОНУ
+        """Отправляет отчёт с финансовой разбивкой."""
+        # Формируем текст СТРОГО ПО ШАБЛОНУ
         lines = [
             f"{date_str} {administrator}",
             f"{total_types} видов, {total_items} позиций, {total_value:.2f}₽",
             f"Предварительный минус: {total_value:.2f}₽",
         ]
         
-        # Строка "Товары на проверке"
         if items_on_check > 0:
             lines.append(f"Товары на проверке: {check_value:.2f}₽ ({items_on_check} шт)")
         else:
             lines.append(f"Товары на проверке: 0.00₽ (0 шт)")
         
-        # Строка "К возмещению"
         lines.append(f"К возмещению: {pay_value:.2f}₽")
         lines.append("")
         lines.append("Ссылки:")
         
-        # Ссылки с деталями: группа (кол-во шт): ссылка
         if all_ref:
             for ref in all_ref:
                 title = ref.get("product_title") or "Товар"
@@ -68,24 +87,23 @@ class TelegramService:
         
         message = "\n".join(lines)
         
-        # Печатаем для отладки
         print(f"[Telegram] 📝 Финальный текст:\n{'─'*40}")
         print(message)
         print(f"{'─'*40}")
         
-        # Отправка
         if pdf_path and os.path.exists(pdf_path):
             return self._send_with_pdf(point_name, message, pdf_path)
         else:
             return self._send_text_only(point_name, message)
-    
+
     def _send_text_only(self, point_name: str, message: str) -> dict:
-        """Отправка текстового сообщения (старый способ)."""
+        """Отправка текстового сообщения."""
         payload = {
             "point_name": point_name,
             "message": message,
             "parse_mode": "HTML",
         }
+        
         try:
             headers = {**self.headers_base, "Content-Type": "application/json"}
             with httpx.Client(timeout=15.0, verify=False) as http:
@@ -101,14 +119,12 @@ class TelegramService:
         except Exception as e:
             print(f"[Telegram] ✗ Ошибка отправки текста: {e}")
             return {"success": False, "error": str(e)}
-    
+
     def _send_with_pdf(self, point_name: str, message: str, pdf_path: str) -> dict:
         """Отправка PDF с подписью (caption)."""
         try:
             pdf_name = Path(pdf_path).name
-            
             with open(pdf_path, "rb") as f:
-                # multipart/form-data
                 files = {
                     "pdf_file": (pdf_name, f, "application/pdf"),
                 }
@@ -118,6 +134,8 @@ class TelegramService:
                     "parse_mode": "HTML",
                 }
                 
+                # 🆕 Используем headers_base который содержит HWID/Hash
+                # НЕ добавляем Content-Type — httpx сам поставит для multipart
                 with httpx.Client(timeout=60.0, verify=False) as http:
                     r = http.post(
                         f"{self.base_url}/send-ref-state-with-pdf",
@@ -127,7 +145,6 @@ class TelegramService:
                     )
                     r.raise_for_status()
                     result = r.json()
-                    
                     if result.get("success"):
                         size_kb = result.get("file_size", 0) / 1024
                         print(

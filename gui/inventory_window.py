@@ -1000,11 +1000,11 @@ class InventoryWindow(QMainWindow):
         plan,
     ):
         """
-        v1.5.4: Отправляет отчёт о смене + обновляет Google Sheets.
+        v1.5.5: Отправляет отчёт о смене + обновляет Google Sheets (синхронно).
         """
         from core.ref_state_repository import RefStateRepository
         from core.telegram_service import TelegramService
-        from core.google_sheets_client import GoogleSheetsClient
+        from core.google_sheets_client_sync import GoogleSheetsClientSync  # 🆕 Синхронная версия
         
         point_name = current_session.point_name or "Неизвестная точка"
         administrator = current_session.giver or "Неизвестный"
@@ -1135,43 +1135,16 @@ class InventoryWindow(QMainWindow):
         print(message)
         print(f"{'─'*40}")
         
-        # === 6. 🆕 ОБНОВЛЕНИЕ GOOGLE SHEETS ===
+        # === 6. 🆕 ОБНОВЛЕНИЕ GOOGLE SHEETS (СИНХРОННО) ===
         if trouble_result and administrator:
             try:
-                import asyncio
-                sheets_client = GoogleSheetsClient(self.client)
-                
-                # Создаём новый event loop если нет активного
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # В Qt event loop — используем другой подход
-                        import concurrent.futures
-                        with concurrent.futures.ThreadPoolExecutor() as executor:
-                            future = executor.submit(
-                                asyncio.run,
-                                sheets_client.update_shift(
-                                    administrator=administrator,
-                                    point_name=point_name,
-                                    total_minus=total_value,
-                                    disputed=check_value,
-                                )
-                            )
-                            sheets_result = future.result(timeout=30)
-                    else:
-                        sheets_result = asyncio.run(sheets_client.update_shift(
-                            administrator=administrator,
-                            point_name=point_name,
-                            total_minus=total_value,
-                            disputed=check_value,
-                        ))
-                except RuntimeError:
-                    sheets_result = asyncio.run(sheets_client.update_shift(
-                        administrator=administrator,
-                        point_name=point_name,
-                        total_minus=total_value,
-                        disputed=check_value,
-                    ))
+                sheets_client = GoogleSheetsClientSync(self.client)
+                sheets_result = sheets_client.update_shift(
+                    administrator=administrator,
+                    point_name=point_name,
+                    total_minus=total_value,
+                    disputed=check_value,
+                )
                 
                 if sheets_result.get("success"):
                     print(f"[GoogleSheets] ✓ {sheets_result.get('message')}")
@@ -1202,8 +1175,15 @@ class InventoryWindow(QMainWindow):
         except Exception as e:
             print(f"[Telegram] ✗ Ошибка: {e}")
 
-
     def _close_inventory(self):
+        """
+        Закрытие окна инвентаризации с транзакционной логикой.
+        
+        Принцип "Всё или ничего":
+        1. Если БД не записалась после retry — НИЧЕГО больше не делаем
+        2. Только после успешной записи в БД: SmartShell, Google Sheets, Telegram
+        3. Если SmartShell упал — блокируем точку до синхронизации
+        """
         self._sync_actuals_from_table()
         
         # ============================================================
@@ -1218,7 +1198,7 @@ class InventoryWindow(QMainWindow):
             "all_groups_with_delta": [],
             "net_total_disposal_value": 0.0,
             "net_total_disposal_items": 0,
-            "single_items_with_delta": [],  # 🆕 одиночные товары
+            "single_items_with_delta": [],
         }
         
         if goods_cache.is_loaded():
@@ -1227,7 +1207,6 @@ class InventoryWindow(QMainWindow):
                 if not visible_products:
                     continue
                 
-                # === ГРУППЫ с 2+ товарами ===
                 if len(visible_products) >= 2:
                     liability = group.get_financial_liability()
                     has_any_delta = any(
@@ -1244,8 +1223,6 @@ class InventoryWindow(QMainWindow):
                         financial_summary["total_liability_value"] += liability["liability_value"]
                         financial_summary["total_liability_items"] += liability["liability_items"]
                         financial_summary["total_all_disposals_value"] += liability["all_disposals_value"]
-                
-                # === 🆕 ОДИНОЧНЫЕ товары (группа = 1 товар) ===
                 else:
                     p = visible_products[0]
                     if p.actual is not None and p.actual != p.stock:
@@ -1261,13 +1238,13 @@ class InventoryWindow(QMainWindow):
                             "compensation_applied": False,
                             "minus_products": [p] if delta < 0 else [],
                             "plus_products": [p] if delta > 0 else [],
-                            "is_single": True,  # 🆕 маркер одиночного товара
+                            "is_single": True,
                         }
                         
                         financial_summary["single_items_with_delta"].append(single_liability)
                         financial_summary["all_groups_with_delta"].append(single_liability)
                         
-                        if delta < 0:  # только недостача → в compensation_groups
+                        if delta < 0:
                             financial_summary["net_total_disposal_value"] += single_liability["liability_value"]
                             financial_summary["net_total_disposal_items"] += single_liability["liability_items"]
                             financial_summary["compensation_groups"].append(single_liability)
@@ -1275,7 +1252,6 @@ class InventoryWindow(QMainWindow):
                             financial_summary["total_liability_items"] += single_liability["liability_items"]
                             financial_summary["total_all_disposals_value"] += single_liability["all_disposals_value"]
         
-        # Логирование
         if financial_summary["compensation_groups"]:
             singles_count = sum(1 for g in financial_summary["compensation_groups"] if g.get("is_single"))
             groups_count = len(financial_summary["compensation_groups"]) - singles_count
@@ -1305,7 +1281,8 @@ class InventoryWindow(QMainWindow):
         all_products = goods_cache.get_all_products() if goods_cache.is_loaded() else []
         service = NormalizationService(self.client)
         discrepancies = service.get_discrepancies(all_products)
-        plan = None; trouble_result = None
+        plan = None
+        trouble_result = None
 
         if discrepancies:
             # ШАГ 1: План нормализации
@@ -1314,10 +1291,8 @@ class InventoryWindow(QMainWindow):
                 plan = dialog.get_result()
                 print(f"[Inventory] ✓ План нормализации подтверждён: {plan.get('total', 0)} операций")
             else:
-                # ❌ Пользователь отменил план — ВОЗВРАЩАЕМСЯ в окно инвентаризации
-                # НЕ закрываем сессию, НЕ закрываем приложение
                 print("[Inventory] ⚠ План нормализации отменён — возврат в окно инвентаризации")
-                return  # ← КЛЮЧЕВОЕ: просто выходим из метода, окно остаётся открытым
+                return
 
             # ШАГ 2: TroubleDialog
             if financial_summary.get("compensation_groups"):
@@ -1341,112 +1316,232 @@ class InventoryWindow(QMainWindow):
                     print(f"[Inventory] ✓ Причины указаны: к оплате={trouble_result.get('toPay', 0):.2f}, "
                         f"на проверке={trouble_result.get('disputed', 0):.2f}")
                 else:
-                    # ❌ Пользователь отменил причины — ВОЗВРАЩАЕМСЯ в окно инвентаризации
-                    # НЕ записываем в БД, НЕ применяем нормализацию
                     print("[Inventory] ⚠ Указание причин отменено — возврат в окно инвентаризации")
-                    return  # ← КЛЮЧЕ
+                    return
 
             # ШАГ 3: БЛОКИРОВКА + ПРОГРЕСС-ДИАЛОГ
             self._close_locked = True
-            self.close_btn.setEnabled(False); self.close_btn.setText("⏳ Финальная обработка...")
+            self.close_btn.setEnabled(False)
+            self.close_btn.setText("⏳ Финальная обработка...")
             QApplication.processEvents()
 
             progress_dialog = QProgressDialog("Обработка смены...", None, 0, 100, self)
             progress_dialog.setWindowTitle("Обработка смены")
             progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
-            progress_dialog.setCancelButton(None); progress_dialog.setMinimumDuration(0)
-            progress_dialog.setValue(0); progress_dialog.setLabelText("🔒 Подготовка...")
-            progress_dialog.show(); QApplication.processEvents()
+            progress_dialog.setCancelButton(None)
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.setValue(0)
+            progress_dialog.setLabelText("🔒 Подготовка...")
+            progress_dialog.show()
+            QApplication.processEvents()
 
             print("\n" + "="*60 + "\n  🔒 ЗАКРЫТИЕ ПРОГРАММЫ ЗАБЛОКИРОВАНО\n" + "="*60)
 
+            # ============================================================
+            #  ФЛАГИ ДЛЯ ТРАНЗАКЦИОННОЙ ЛОГИКИ
+            # ============================================================
+            db_success = True
+            db_errors = []
+            pdf_path = None
+            ss_success = False
+            
             try:
-                # ШАГ 4: ЗАПИСЬ В БД
+                # ============================================================
+                #  ШАГ 4: ЗАПИСЬ В БД (С RETRY И ТРАНЗАКЦИОННОЙ ЛОГИКОЙ)
+                # ============================================================
                 end_time = datetime.now()
                 progress_dialog.setLabelText("💾 Сохранение операций в БД...")
-                progress_dialog.setValue(10); QApplication.processEvents()
+                progress_dialog.setValue(10)
+                QApplication.processEvents()
+                
+                total_attempts = 0
+                
                 try:
                     repo = InventoryRepository(self.client)
+                    
+                    # 1. Сохранение операций (с retry)
                     operations_to_save = []
                     for op_data in plan.get("operations", []):
                         pid = op_data.get("product_id")
-                        if pid is None: continue
+                        if pid is None:
+                            continue
                         product = goods_cache.get_by_id(pid)
                         product_cost = getattr(product, 'cost', 0) or 0.0 if product else 0.0
                         operations_to_save.append({
-                            "product_id": pid, "product_title": op_data.get("product_title", ""),
+                            "product_id": pid,
+                            "product_title": op_data.get("product_title", ""),
                             "quantity": op_data.get("quantity", abs(op_data.get("delta", 0))),
-                            "cost": product_cost, "operation_type": op_data.get("type", ""), "reason": "",
+                            "cost": product_cost,
+                            "operation_type": op_data.get("type", ""),
+                            "reason": "",
                         })
+                    
                     if operations_to_save:
-                        r = repo.save_operations(operations=operations_to_save,
-                            point_name=current_session.point_name, administrator=current_session.giver,
-                            session_label=current_session.shift_label or "", operation_date=end_time)
-                        if r["success"]: print(f"[DB] ✓ {r['inserted']} операций в inventory_operation")
-
+                        success, result, attempts = repo.save_operations_with_retry(
+                            operations=operations_to_save,
+                            point_name=current_session.point_name,
+                            administrator=current_session.giver,
+                            session_label=current_session.shift_label or "",
+                            operation_date=end_time,
+                            max_retries=3
+                        )
+                        total_attempts += attempts
+                        if success:
+                            print(f"[DB] ✓ {result['inserted']} операций в inventory_operation ({attempts} попыток)")
+                        else:
+                            db_success = False
+                            db_errors.append(f"save_operations: {result.get('error', 'unknown')}")
+                    
+                    # 2. Сохранение итога смены (с retry)
                     progress_dialog.setLabelText("💾 Сохранение итога смены...")
-                    progress_dialog.setValue(25); QApplication.processEvents()
-
-                    all_item = [{"product_id": p.id, "title": p.title, "stock": p.stock,
-                                "actual": p.actual, "delta": p.actual - p.stock,
-                                "cost": getattr(p, 'cost', 0) or 0}
-                                for p in all_products if p.actual is not None and p.actual != p.stock]
+                    progress_dialog.setValue(25)
+                    QApplication.processEvents()
+                    
+                    all_item = [
+                        {
+                            "product_id": p.id, "title": p.title, "stock": p.stock,
+                            "actual": p.actual, "delta": p.actual - p.stock,
+                            "cost": getattr(p, 'cost', 0) or 0
+                        }
+                        for p in all_products if p.actual is not None and p.actual != p.stock
+                    ]
+                    
                     all_item_dis = []
                     for g in financial_summary.get("compensation_groups", []):
                         group = next((gg for gg in goods_cache.get_groups() if gg.name == g["group_name"]), None)
-                        if not group: continue
+                        if not group:
+                            continue
                         for p in group.products:
                             if p.stock > 0:
                                 delta = (p.actual or 0) - p.stock
                                 all_item_dis.append({
                                     "product_id": p.id, "title": p.title, "group": group.name,
                                     "stock": p.stock, "actual": p.actual or 0, "delta": delta,
-                                    "net_group_delta": g["net_delta"], "liability_value": g["liability_value"],
+                                    "net_group_delta": g["net_delta"],
+                                    "liability_value": g["liability_value"],
                                     "cost": getattr(p, 'cost', 0) or 0,
                                 })
+                    
                     total_liability = financial_summary.get("total_liability_value", 0.0)
                     if total_liability > 0 or all_item:
-                        r = repo.save_session_dispol(point_name=current_session.point_name,
-                            administrator=current_session.giver, cost=total_liability,
-                            all_item=all_item, all_item_dis=all_item_dis,
-                            session_label=current_session.shift_label or "", reason="Пересчёт смены")
-                        if r["success"]: print(f"[DB] ✓ session_dispol (id={r['id']})")
-
+                        success, result, attempts = repo.save_session_dispol_with_retry(
+                            point_name=current_session.point_name,
+                            administrator=current_session.giver,
+                            cost=total_liability,
+                            all_item=all_item,
+                            all_item_dis=all_item_dis,
+                            session_label=current_session.shift_label or "",
+                            reason="Пересчёт смены",
+                            max_retries=3
+                        )
+                        total_attempts += attempts
+                        if success:
+                            print(f"[DB] ✓ session_dispol (id={result['id']}) ({attempts} попыток)")
+                        else:
+                            db_success = False
+                            db_errors.append(f"save_session_dispol: {result.get('error', 'unknown')}")
+                    
+                    # 3. Сохранение причин расхождений (с retry)
                     progress_dialog.setLabelText("💾 Сохранение причин расхождений...")
-                    progress_dialog.setValue(40); QApplication.processEvents()
-
+                    progress_dialog.setValue(40)
+                    QApplication.processEvents()
+                    
                     if trouble_result and trouble_result.get("trouble_operations"):
-                        r = repo.save_trouble_operations(operations=trouble_result["trouble_operations"],
-                            point_name=current_session.point_name, administrator=current_session.giver,
-                            session_label=current_session.shift_label or "", operation_date=end_time)
-                        if r["success"]: print(f"[DB] ✓ {r['inserted']} trouble-операций")
-                        r = repo.save_correct_trouble(point_name=current_session.point_name,
-                            administrator=current_session.giver, cost=trouble_result["cost"],
+                        success, result, attempts = repo.save_trouble_operations_with_retry(
+                            operations=trouble_result["trouble_operations"],
+                            point_name=current_session.point_name,
+                            administrator=current_session.giver,
+                            session_label=current_session.shift_label or "",
+                            operation_date=end_time,
+                            max_retries=3
+                        )
+                        total_attempts += attempts
+                        if success:
+                            print(f"[DB] ✓ {result['inserted']} trouble-операций ({attempts} попыток)")
+                        else:
+                            db_success = False
+                            db_errors.append(f"save_trouble_operations: {result.get('error', 'unknown')}")
+                        
+                        success, result, attempts = repo.save_correct_trouble_with_retry(
+                            point_name=current_session.point_name,
+                            administrator=current_session.giver,
+                            cost=trouble_result["cost"],
                             allitemTrouble=trouble_result["allitemTrouble"],
                             allitemDis=trouble_result["allitemDis"],
                             costTrouble=trouble_result["costTrouble"],
                             costDisTrouble=trouble_result["costDisTrouble"],
                             allRef=trouble_result["allRef"],
-                            session_label=current_session.shift_label or "")
-                        if r["success"]: print(f"[DB] ✓ correctTrouble (id={r['id']})")
-                except Exception as e:
-                    print(f"[DB] ✗ Ошибка при записи в БД: {e}")
-                    import traceback; traceback.print_exc()
+                            session_label=current_session.shift_label or "",
+                            max_retries=3
+                        )
+                        total_attempts += attempts
+                        if success:
+                            print(f"[DB] ✓ correctTrouble (id={result['id']}) ({attempts} попыток)")
+                        else:
+                            db_success = False
+                            db_errors.append(f"save_correct_trouble: {result.get('error', 'unknown')}")
 
-                # ШАГ 5: PDF ОТЧЁТ
+                except Exception as e:
+                    db_success = False
+                    db_errors.append(f"Exception: {e}")
+                    print(f"[DB] ✗ Критическая ошибка: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                print(f"[DB] 📊 Итого: {total_attempts} попыток записи в БД")
+                
+                # ============================================================
+                #  ПРОВЕРКА: если БД не записалась — ОСТАНАВЛИВАЕМ ВСЁ
+                # ============================================================
+                if not db_success:
+                    progress_dialog.close()
+                    
+                    error_details = "\n".join(f"• {err}" for err in db_errors[:5])
+                    if len(db_errors) > 5:
+                        error_details += f"\n... и ещё {len(db_errors) - 5} ошибок"
+                    
+                    QMessageBox.critical(
+                        self,
+                        "Ошибка записи в базу данных",
+                        f"⚠️ Не удалось сохранить данные смены в базу данных!\n\n"
+                        f"Ошибки:\n{error_details}\n\n"
+                        f"❌ SmartShell НЕ был обновлён\n"
+                        f"❌ Google Sheets НЕ обновлены\n"
+                        f"❌ PDF отчёт НЕ отправлен\n\n"
+                        f"Данные смены НЕ потеряны — они в памяти приложения.\n"
+                        f"Проверьте интернет-соединение и попробуйте закрыть смену снова."
+                    )
+                    
+                    print(f"[Inventory] ⛔ Остановка: БД недоступна, SmartShell не применён")
+                    return
+                
+                print(f"[DB] ✅ Все записи в БД успешны, продолжаем...")
+
+                # ============================================================
+                #  ШАГ 5: PDF ОТЧЁТ
+                # ============================================================
                 progress_dialog.setLabelText("📄 Формирование PDF отчёта...")
-                progress_dialog.setValue(55); QApplication.processEvents()
+                progress_dialog.setValue(55)
+                QApplication.processEvents()
                 try:
-                    pdf_path = generate_normalization_report(discrepancies, plan,
-                        verification_result=None, financial_summary=financial_summary,
-                        trouble_result=trouble_result)
+                    pdf_path = generate_normalization_report(
+                        discrepancies, plan,
+                        verification_result=None,
+                        financial_summary=financial_summary,
+                        trouble_result=trouble_result
+                    )
                     print(f"[Report] ✓ PDF отчёт сохранён: {pdf_path}")
                 except Exception as e:
                     print(f"[Report] ✗ Ошибка генерации PDF: {e}")
-                    import traceback; traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
 
+                # ============================================================
+                #  ШАГ 6: RefState + Google Sheets + Telegram
+                # ============================================================
                 progress_dialog.setLabelText("📱 Отправка отчёта в Telegram...")
-                progress_dialog.setValue(60); QApplication.processEvents()
+                progress_dialog.setValue(60)
+                QApplication.processEvents()
                 try:
                     self._save_ref_state_and_send_telegram(
                         trouble_result=trouble_result,
@@ -1457,63 +1552,174 @@ class InventoryWindow(QMainWindow):
                     )
                 except Exception as e:
                     print(f"[RefState/Telegram] ✗ Ошибка (не критично): {e}")
-                    import traceback; traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
 
-                try: service.sync_products_to_db(all_products)
-                except Exception as e: print(f"[DB] ✗ Ошибка синхронизации товаров: {e}")
+                try:
+                    service.sync_products_to_db(all_products)
+                except Exception as e:
+                    print(f"[DB] ✗ Ошибка синхронизации товаров: {e}")
 
-                # ШАГ 6: ПРИМЕНЕНИЕ В SMARTSHELL
-                progress_dialog.hide(); QApplication.processEvents()
+                # ============================================================
+                #  ШАГ 7: ПРИМЕНЕНИЕ В SMARTSHELL
+                # ============================================================
+                progress_dialog.hide()
+                QApplication.processEvents()
+                
+                session_info = {
+                    "start_time": current_session.start_time.isoformat() if current_session.start_time else None,
+                    "shift_type": current_session.shift_type,
+                    "duration": current_session.elapsed_str,
+                    "shift_label": current_session.shift_label,
+                }
+                
                 if plan and plan.get("operations"):
-                    self.close_btn.setText("🚀 Применение в SmartShell..."); QApplication.processEvents()
-                    session_info = {
-                        "start_time": current_session.start_time.isoformat() if current_session.start_time else None,
-                        "shift_type": current_session.shift_type,
-                        "duration": current_session.elapsed_str,
-                        "shift_label": current_session.shift_label,
-                    }
+                    self.close_btn.setText("🚀 Применение в SmartShell...")
+                    QApplication.processEvents()
+                    
                     ss_result = service.apply_normalization_plan(plan, session_info)
-                    ss_failed = ss_result.get("failed", 0); ss_success = ss_result.get("success", 0)
-                    if ss_failed > 0 and ss_success == 0:
-                        errors_text = "\n".join(ss_result.get("errors", [])[:5])
-                        QMessageBox.critical(self, "Ошибка SmartShell",
-                            f"⚠️ Не удалось применить изменения в SmartShell!\n\n"
-                            f"Успешно: {ss_success}\nОшибок: {ss_failed}\n\nОшибки:\n{errors_text}\n\n"
-                            f"Данные уже сохранены в БД и отчёт сформирован.")
-                    elif ss_failed > 0:
-                        QMessageBox.warning(self, "Частичная ошибка SmartShell",
-                            f"⚠️ Не все операции применены в SmartShell:\n\n"
-                            f"Успешно: {ss_success}\nОшибок: {ss_failed}\n\n"
-                            f"Данные уже сохранены в БД.")
+                    ss_failed = ss_result.get("failed", 0)
+                    ss_success_count = ss_result.get("success", 0)
+                    ss_success = (ss_failed == 0)
+                    
+                    if not ss_success:
+                        # 🚨 SMARTSHELL УПАЛ — СОХРАНЯЕМ PENDING И БЛОКИРУЕМ ТОЧКУ
+                        errors_text = "\n".join(str(e) for e in ss_result.get("errors", [])[:5])
+                        pending_id = None
+                        
+                        try:
+                            repo = InventoryRepository(self.client)
+                            
+                            # 1. Сохраняем pending операцию
+                            pending_result = repo.save_pending_smartshell_operation(
+                                plan=plan,
+                                session_info=session_info,
+                                error_details=errors_text,
+                                point_name=current_session.point_name,
+                                administrator=current_session.giver,
+                            )
+                            
+                            if pending_result.get("success"):
+                                pending_id = pending_result["id"]
+                                print(f"[SmartShell] ⚠ Операция сохранена (pending_id={pending_id})")
+                                
+                                # 2. 🔒 БЛОКИРУЕМ точку до синхронизации
+                                lock_reason = (
+                                    f"SmartShell не применил {ss_failed} операций из "
+                                    f"{len(plan.get('operations', []))}. "
+                                    f"Ожидание синхронизации (pending_id={pending_id}). "
+                                    f"Следующая инвентаризация на этой точке будет заблокирована "
+                                    f"до успешного применения операций."
+                                )
+                                
+                                lock_result = repo.lock_point_for_sync(
+                                    point_name=current_session.point_name,
+                                    reason=lock_reason,
+                                    pending_operation_id=pending_id
+                                )
+                                
+                                if lock_result.get("success"):
+                                    print(f"[Inventory] 🔒 Точка {current_session.point_name} "
+                                        f"заблокирована до синхронизации")
+                        
+                        except Exception as e:
+                            print(f"[Inventory] ✗ Ошибка сохранения pending/блокировки: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        
+                        # 3. Отправляем критический алерт в Telegram
+                        try:
+                            telegram = TelegramService()
+                            
+                            alert_message = (
+                                f"🚨 <b>SMARTSHELL НЕ ПРИМЕНИЛ ОПЕРАЦИИ!</b>\n\n"
+                                f"👤 <b>Админ:</b> {current_session.giver}\n"
+                                f"🏪 <b>Точка:</b> {current_session.point_name}\n"
+                                f"📦 <b>Операций:</b> {len(plan.get('operations', []))}\n"
+                                f"❌ <b>Ошибок:</b> {ss_failed}\n"
+                                f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+                            )
+                            
+                            if pending_id:
+                                alert_message += f"🆔 <b>Pending ID:</b> {pending_id}\n"
+                            
+                            alert_message += (
+                                f"\n<b>Ошибки:</b>\n{errors_text}\n\n"
+                                f"✅ Данные сохранены в БД и Google Sheets\n"
+                                f"🔒 <b>Точка заблокирована</b> до синхронизации\n"
+                                f"⏳ Retry worker будет пытаться применить каждые 5 мин\n"
+                                f"🔄 После синхронизации точка разблокируется"
+                            )
+                            
+                            telegram.send_text_to_control_topic(alert_message)
+                            print(f"[Telegram] ✓ Критический алерт отправлен")
+                        except Exception as e:
+                            print(f"[Telegram] ✗ Не удалось отправить алерт: {e}")
+                        
+                        # 4. Показываем пользователю
+                        if ss_success_count == 0:
+                            QMessageBox.critical(
+                                self, "Ошибка SmartShell",
+                                f"⚠️ Не удалось применить изменения в SmartShell!\n\n"
+                                f"Успешно: {ss_success_count}\nОшибок: {ss_failed}\n\n"
+                                f"Ошибки:\n{errors_text}\n\n"
+                                f"✅ Данные сохранены в БД и Google Sheets\n"
+                                f"🔒 <b>Точка заблокирована</b> до синхронизации\n"
+                                f"⏳ Система попытается применить автоматически\n"
+                                f"📱 Руководитель уведомлён"
+                            )
+                        else:
+                            QMessageBox.warning(
+                                self, "Частичная ошибка SmartShell",
+                                f"⚠️ Не все операции применены в SmartShell:\n\n"
+                                f"Успешно: {ss_success_count}\nОшибок: {ss_failed}\n\n"
+                                f"✅ Данные сохранены в БД\n"
+                                f"🔒 <b>Точка заблокирована</b> до синхронизации\n"
+                                f"⏳ Retry worker попытается применить остаток"
+                            )
+                    else:
+                        print(f"[SmartShell] ✅ Все операции применены успешно")
 
-                    # ШАГ 7: АВТОМАТИЧЕСКАЯ ПОСТ-ВЕРИФИКАЦИЯ
-                    self.close_btn.setText("🔍 Проверка применения..."); QApplication.processEvents()
-                    verify_result = service.verify_application(plan)
-                    if not verify_result.get("all_ok", True) and verify_result.get("failed", 0) > 0:
-                        failed_items = verify_result.get("failed_items", [])
-                        items_text = "\n".join(
-                            f"  • {it['product_title']}: ожидалось {it['expected']}, "
-                            f"в системе {it['actual_stock']}" for it in failed_items[:10])
-                        QMessageBox.warning(self, "Расхождение после применения",
-                            f"⚠️ Фактическое состояние в SmartShell отличается от ожидаемого:\n\n"
-                            f"Успешно применено: {verify_result.get('verified', 0)}\n"
-                            f"Расхождений: {verify_result.get('failed', 0)}\n\n"
-                            f"Детали:\n{items_text}\n\n"
-                            f"Данные уже сохранены в БД и отчёт сформирован.")
+                    # ШАГ 8: АВТОМАТИЧЕСКАЯ ПОСТ-ВЕРИФИКАЦИЯ
+                    if ss_success:
+                        self.close_btn.setText("🔍 Проверка применения...")
+                        QApplication.processEvents()
+                        verify_result = service.verify_application(plan)
+                        if not verify_result.get("all_ok", True) and verify_result.get("failed", 0) > 0:
+                            failed_items = verify_result.get("failed_items", [])
+                            items_text = "\n".join(
+                                f"  • {it['product_title']}: ожидалось {it['expected']}, "
+                                f"в системе {it['actual_stock']}" for it in failed_items[:10]
+                            )
+                            QMessageBox.warning(
+                                self, "Расхождение после применения",
+                                f"⚠️ Фактическое состояние в SmartShell отличается от ожидаемого:\n\n"
+                                f"Успешно применено: {verify_result.get('verified', 0)}\n"
+                                f"Расхождений: {verify_result.get('failed', 0)}\n\n"
+                                f"Детали:\n{items_text}\n\n"
+                                f"Данные уже сохранены в БД и отчёт сформирован."
+                            )
+            
             except Exception as e:
                 print(f"[Inventory] ✗ Критическая ошибка: {e}")
-                import traceback; traceback.print_exc()
-                QMessageBox.critical(self, "Критическая ошибка",
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(
+                    self, "Критическая ошибка",
                     f"⚠ Ошибка во время финальной обработки:\n\n{e}\n\n"
-                    f"Данные уже сохранены в БД.")
+                    f"Проверьте консоль для деталей."
+                )
+            
             finally:
-                # ШАГ 8: РАЗБЛОКИРОВКА
+                # ШАГ 9: РАЗБЛОКИРОВКА UI
                 try:
                     if 'progress_dialog' in locals() and progress_dialog is not None:
                         progress_dialog.close()
-                except Exception: pass
+                except Exception:
+                    pass
                 self._close_locked = False
-                self.close_btn.setEnabled(True); self.close_btn.setText("✕  Закрыть пересчёт")
+                self.close_btn.setEnabled(True)
+                self.close_btn.setText("✕  Закрыть пересчёт")
                 QApplication.processEvents()
                 print("\n" + "="*60 + "\n  🔓 ЗАКРЫТИЕ ПРОГРАММЫ РАЗБЛОКИРОВАНО\n" + "="*60)
         else:
@@ -1528,9 +1734,9 @@ class InventoryWindow(QMainWindow):
         less = sum(1 for p in all_products if p.status == "less")
         equal = sum(1 for p in all_products if p.status == "equal")
         unknown = sum(1 for p in all_products if p.status == "unknown")
-        end_time = datetime.now()
         duration = current_session.elapsed_str
         emoji, mood_desc = self._get_mood_emoji(less)
+        
         print(f"\n{'='*60}\n  📋 ИТОГИ ПЕРЕСМЕНКИ\n{'='*60}")
         print(f"  Смена: {current_session.shift_label} | Тип: {current_session.shift_type}")
         print(f"  Длительность: {duration} | Отдающий: {current_session.giver} | Принимающий: {current_session.receiver}")
@@ -1539,7 +1745,8 @@ class InventoryWindow(QMainWindow):
         print(f"  Недостача: {less} {emoji} | Избыток: {more}")
         print(f"  Настроение: {emoji} {mood_desc}")
         print(f"{'─'*60}")
-        if plan: print(f"  📋 Запланировано: {plan.get('total', 0)} операций")
+        if plan:
+            print(f"  📋 Запланировано: {plan.get('total', 0)} операций")
         if trouble_result:
             print(f"  💰 ИТОГИ РАСХОЖДЕНИЙ:")
             print(f"     💰 Общий минус:  {trouble_result.get('totalMinus', 0):.2f}₽")
@@ -1548,19 +1755,20 @@ class InventoryWindow(QMainWindow):
         print(f"{'='*60}\n")
 
         goods_cache.unsubscribe(self._on_cache_updated)
-        if hasattr(self, '_timer'): self._timer.stop()
+        if hasattr(self, '_timer'):
+            self._timer.stop()
 
-        # 🆕 ШАГ 9: ФИНАЛЬНЫЙ ДИАЛОГ УСПЕШНОГО ЗАВЕРШЕНИЯ
+        # ШАГ 10: ФИНАЛЬНЫЙ ДИАЛОГ УСПЕШНОГО ЗАВЕРШЕНИЯ
         try:
             from gui.completion_dialog import CompletionDialog
             stages = [
                 ("План нормализации", plan is not None),
-                ("Запись операций в БД", True),
+                ("Запись операций в БД", db_success if discrepancies else True),
                 ("Указание причин расхождений",
-                trouble_result is not None or not financial_summary["compensation_groups"]),
-                ("Сохранение итогов в БД", True),
-                ("PDF-отчёт", True),
-                ("Применение в SmartShell", True),
+                trouble_result is not None or not financial_summary.get("compensation_groups")),
+                ("Сохранение итогов в БД", db_success if discrepancies else True),
+                ("PDF-отчёт", pdf_path is not None if discrepancies else True),
+                ("Применение в SmartShell", ss_success if discrepancies else True),
             ]
             summary = {
                 "shift_label": current_session.shift_label or "—",
@@ -1579,11 +1787,10 @@ class InventoryWindow(QMainWindow):
             dialog.exec()
         except Exception as e:
             print(f"[Completion] ⚠ Не удалось показать финальный диалог: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
 
         self.close()
-
-
 
     def _sync_actuals_from_table(self):
         def sync_item(item):
@@ -1601,6 +1808,7 @@ class InventoryWindow(QMainWindow):
             for j in range(item.childCount()): sync_item(item.child(j))
 
     def closeEvent(self, event):
+
         """
         Перехват закрытия окна.
         Блокирует закрытие во время финальной обработки (БД + SmartShell).
@@ -1651,3 +1859,380 @@ class InventoryWindow(QMainWindow):
             self._active_worker.quit()
             self._active_worker.wait(1000)
         super().closeEvent(event)
+
+
+    def _retry_request(self, request_func, max_retries=3, delay=2.0):
+        """
+        Выполняет запрос с retry логикой.
+        
+        Args:
+            request_func: Функция которая делает запрос
+            max_retries: Максимальное количество попыток
+            delay: Задержка между попытками в секундах
+        
+        Returns:
+            tuple: (success: bool, result: dict, attempts: int)
+        """
+        import time
+        last_result = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = request_func()
+                if result.get("success"):
+                    if attempt > 1:
+                        print(f"[DB] ✓ Успех на попытке {attempt}")
+                    return True, result, attempt
+                else:
+                    last_result = result
+                    print(f"[DB] ⚠ Попытка {attempt}/{max_retries}: {result.get('error')}")
+            except Exception as e:
+                last_result = {"success": False, "error": str(e)}
+                print(f"[DB] ⚠ Попытка {attempt}/{max_retries}: Exception {e}")
+            
+            if attempt < max_retries:
+                print(f"[DB] 🔄 Повтор через {delay}с...")
+                time.sleep(delay)
+        
+        return False, last_result or {"error": "Max retries exceeded"}, max_retries
+
+
+    def save_operations_with_retry(self, operations, point_name, administrator, 
+                                    session_label, operation_date, max_retries=3):
+        """save_operations с retry"""
+        def _do_save():
+            return self.save_operations(
+                operations=operations,
+                point_name=point_name,
+                administrator=administrator,
+                session_label=session_label,
+                operation_date=operation_date
+            )
+        return self._retry_request(_do_save, max_retries)
+
+
+    def save_session_dispol_with_retry(self, point_name, administrator, cost,
+                                        all_item, all_item_dis, session_label, 
+                                        reason, max_retries=3):
+        """save_session_dispol с retry"""
+        def _do_save():
+            return self.save_session_dispol(
+                point_name=point_name,
+                administrator=administrator,
+                cost=cost,
+                all_item=all_item,
+                all_item_dis=all_item_dis,
+                session_label=session_label,
+                reason=reason
+            )
+        return self._retry_request(_do_save, max_retries)
+
+
+    def save_trouble_operations_with_retry(self, operations, point_name, 
+                                            administrator, session_label,
+                                            operation_date, max_retries=3):
+        """save_trouble_operations с retry"""
+        def _do_save():
+            return self.save_trouble_operations(
+                operations=operations,
+                point_name=point_name,
+                administrator=administrator,
+                session_label=session_label,
+                operation_date=operation_date
+            )
+        return self._retry_request(_do_save, max_retries)
+
+
+    def save_correct_trouble_with_retry(self, point_name, administrator, cost,
+                                        allitemTrouble, allitemDis, costTrouble,
+                                        costDisTrouble, allRef, session_label,
+                                        max_retries=3):
+        """save_correct_trouble с retry"""
+        def _do_save():
+            return self.save_correct_trouble(
+                point_name=point_name,
+                administrator=administrator,
+                cost=cost,
+                allitemTrouble=allitemTrouble,
+                allitemDis=allitemDis,
+                costTrouble=costTrouble,
+                costDisTrouble=costDisTrouble,
+                allRef=allRef,
+                session_label=session_label
+            )
+        return self._retry_request(_do_save, max_retries)
+
+    # ============================================================
+    #  🆕 БЛОКИРОВКА ТОЧЕК ДЛЯ СИНХРОНИЗАЦИИ
+    # ============================================================
+
+    def lock_point_for_sync(self, point_name: str, reason: str,
+                            pending_operation_id: int = None) -> dict:
+        """
+        Блокирует точку до синхронизации со SmartShell.
+        
+        Пока точка заблокирована — следующая инвентаризация невозможна.
+        Это предотвращает двойное списание товаров.
+        """
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO point_locks
+                    (point_name, locked_at, locked_by, reason, pending_operation_id)
+                    VALUES (%s, NOW(), 'system', %s, %s)""",
+                    (point_name, reason, pending_operation_id)
+                )
+                conn.commit()
+                lock_id = cur.lastrowid
+                print(f"[DB] 🔒 Точка {point_name} заблокирована (lock_id={lock_id})")
+                return {"success": True, "lock_id": lock_id}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка блокировки точки: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def is_point_locked(self, point_name: str) -> dict:
+        """
+        Проверяет заблокирована ли точка.
+        
+        Returns:
+            {
+                "locked": bool,
+                "lock": {...},  # если locked=True
+                "reason": str
+            }
+        """
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM point_locks
+                    WHERE point_name = %s AND resolved_at IS NULL
+                    ORDER BY locked_at DESC
+                    LIMIT 1""",
+                    (point_name,)
+                )
+                lock = cur.fetchone()
+                if lock:
+                    return {
+                        "locked": True,
+                        "lock": lock,
+                        "reason": lock.get("reason", "")
+                    }
+                return {"locked": False}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка проверки блокировки: {e}")
+            return {"locked": False}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def unlock_point(self, lock_id: int) -> dict:
+        """Разблокирует точку по ID блокировки."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE point_locks
+                    SET resolved_at = NOW()
+                    WHERE id = %s""",
+                    (lock_id,)
+                )
+                conn.commit()
+                print(f"[DB] 🔓 Точка разблокирована (lock_id={lock_id})")
+                return {"success": True}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка разблокировки: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def unlock_point_by_pending_id(self, pending_operation_id: int) -> dict:
+        """Разблокирует точку по ID pending операции."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE point_locks
+                    SET resolved_at = NOW()
+                    WHERE pending_operation_id = %s AND resolved_at IS NULL""",
+                    (pending_operation_id,)
+                )
+                affected = cur.rowcount
+                conn.commit()
+                if affected > 0:
+                    print(f"[DB] 🔓 Точка разблокирована (pending_id={pending_operation_id})")
+                    return {"success": True, "unlocked": affected}
+                return {"success": True, "unlocked": 0}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка разблокировки по pending_id: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    # ============================================================
+    #  🆕 PENDING SMARTSHELL ОПЕРАЦИИ
+    # ============================================================
+
+    def save_pending_smartshell_operation(self, plan: dict, session_info: dict,
+                                        error_details: str, point_name: str,
+                                        administrator: str) -> dict:
+        """
+        Сохраняет операцию которая не применилась в SmartShell.
+        Retry worker будет пытаться применить её позже.
+        """
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO pending_smartshell_operations
+                    (point_name, administrator, plan_json, session_info_json,
+                    error_details, created_at, retry_count, last_attempt, status)
+                    VALUES (%s, %s, %s, %s, %s, NOW(), 0, NULL, 'pending')""",
+                    (
+                        point_name,
+                        administrator,
+                        json.dumps(plan, ensure_ascii=False),
+                        json.dumps(session_info, ensure_ascii=False),
+                        error_details,
+                    ),
+                )
+                conn.commit()
+                new_id = cur.lastrowid
+                print(f"[DB] ✓ Сохранена pending операция (id={new_id})")
+                return {"success": True, "id": new_id}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка сохранения pending: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def get_pending_operations(self, limit: int = 10) -> list:
+        """Получает pending операции для повторной попытки."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM pending_smartshell_operations
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC
+                    LIMIT %s""",
+                    (limit,)
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка get_pending: {e}")
+            return []
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def mark_operation_success(self, operation_id: int) -> dict:
+        """Отмечает операцию как успешную."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pending_smartshell_operations
+                    SET status = 'success', completed_at = NOW()
+                    WHERE id = %s""",
+                    (operation_id,)
+                )
+                conn.commit()
+                return {"success": True}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка mark_success: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def mark_operation_failed(self, operation_id: int, reason: str) -> dict:
+        """Отмечает операцию как проваленную."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pending_smartshell_operations
+                    SET status = 'failed', error_details = %s, completed_at = NOW()
+                    WHERE id = %s""",
+                    (reason, operation_id)
+                )
+                conn.commit()
+                return {"success": True}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка mark_failed: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+
+    def increment_retry_count(self, operation_id: int) -> dict:
+        """Увеличивает счётчик попыток."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pending_smartshell_operations
+                    SET retry_count = retry_count + 1, last_attempt = NOW()
+                    WHERE id = %s""",
+                    (operation_id,)
+                )
+                conn.commit()
+                return {"success": True}
+        except Exception as e:
+            print(f"[DB] ✗ Ошибка increment_retry: {e}")
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass

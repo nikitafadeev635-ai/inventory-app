@@ -6,35 +6,44 @@ import httpx
 from datetime import datetime
 from config import PROXY_SERVER_URL, API_SECRET_KEY
 
+# 🆕 Импорт для HWID и Hash
+try:
+    from core.integrity_checker import get_exe_hash, get_hardware_id
+    _INTEGRITY_AVAILABLE = True
+except ImportError:
+    _INTEGRITY_AVAILABLE = False
+    get_exe_hash = lambda: ""
+    get_hardware_id = lambda: ""
+
 
 class RefStateRepository:
     def __init__(self):
         self.base_url = f"{PROXY_SERVER_URL}/api/ref-state"
+        
+        # 🆕 Вычисляем HWID и Hash один раз
+        self._client_hash = ""
+        self._client_hwid = ""
+        if _INTEGRITY_AVAILABLE:
+            try:
+                self._client_hash = get_exe_hash() or ""
+                self._client_hwid = get_hardware_id() or ""
+            except Exception as e:
+                print(f"[RefState] ⚠ Ошибка HWID/Hash: {e}")
+        
+        # Базовые заголовки
         self.headers = {
-            "X-API-Key": API_SECRET_KEY,  # ✅ ИСПРАВЛЕНО: было X-API-Secret
+            "X-API-Key": API_SECRET_KEY,
             "Content-Type": "application/json",
         }
-    
+        
+        # 🆕 Добавляем HWID и Hash
+        if self._client_hash:
+            self.headers["X-Client-Hash"] = self._client_hash
+        if self._client_hwid:
+            self.headers["X-Client-HWID"] = self._client_hwid
+
     def save_general(self, data: dict) -> dict:
-        """
-        Сохраняет общую запись в refStateGeneral.
-        
-        Args:
-            data: {
-                "point_name": str,
-                "administrator": str,
-                "session_label": str,
-                "total_types": int,
-                "total_items": int,
-                "total_value": float,
-                "items_on_check": int,
-                "links_count": int,
-                "pdf_path": str,
-            }
-        
-        Returns:
-            {"success": bool, "id": int, "error": str}
-        """
+        """Сохраняет общую запись в refStateGeneral."""
         try:
             with httpx.Client(timeout=15.0, verify=False) as http:
                 r = http.post(
@@ -42,7 +51,6 @@ class RefStateRepository:
                     headers=self.headers,
                     json=data,
                 )
-                
                 if r.status_code == 200:
                     result = r.json()
                     if result.get("success"):
@@ -51,19 +59,15 @@ class RefStateRepository:
                     else:
                         print(f"[RefState] ✗ Сервер вернул ошибку: {result}")
                         return {"success": False, "error": str(result)}
-                
                 elif r.status_code == 401:
                     print(f"[RefState] ✗ Ошибка авторизации: неверный API key")
                     return {"success": False, "error": "unauthorized"}
-                
                 elif r.status_code == 422:
                     print(f"[RefState] ✗ Ошибка валидации: {r.text[:200]}")
                     return {"success": False, "error": f"validation: {r.text[:200]}"}
-                
                 else:
                     print(f"[RefState] ✗ HTTP {r.status_code}: {r.text[:200]}")
                     return {"success": False, "error": f"http_{r.status_code}"}
-        
         except httpx.TimeoutException:
             print(f"[RefState] ✗ Таймаут при сохранении general")
             return {"success": False, "error": "timeout"}
@@ -72,26 +76,9 @@ class RefStateRepository:
             import traceback
             traceback.print_exc()
             return {"success": False, "error": str(e)}
-    
+
     def save_detailed(self, general_id: int, items: list) -> dict:
-        """
-        Сохраняет детализацию (каждая ссылка по товару) в refStateDetailed.
-        
-        Args:
-            general_id: ID из refStateGeneral
-            items: list of {
-                "administrator": str,
-                "product_title": str,
-                "product_id": int,
-                "reference": str,
-                "quantity": int,
-                "value": float,
-                "reason": str,
-            }
-        
-        Returns:
-            {"success": bool, "inserted": int, "error": str}
-        """
+        """Сохраняет детализацию в refStateDetailed."""
         if not items:
             return {"success": True, "inserted": 0}
         
@@ -107,7 +94,6 @@ class RefStateRepository:
                     headers=self.headers,
                     json=payload,
                 )
-                
                 if r.status_code == 200:
                     result = r.json()
                     if result.get("success"):
@@ -116,19 +102,15 @@ class RefStateRepository:
                     else:
                         print(f"[RefState] ✗ Сервер вернул ошибку: {result}")
                         return {"success": False, "error": str(result)}
-                
                 elif r.status_code == 401:
                     print(f"[RefState] ✗ Ошибка авторизации: неверный API key")
                     return {"success": False, "error": "unauthorized"}
-                
                 elif r.status_code == 422:
                     print(f"[RefState] ✗ Ошибка валидации: {r.text[:200]}")
                     return {"success": False, "error": f"validation: {r.text[:200]}"}
-                
                 else:
                     print(f"[RefState] ✗ HTTP {r.status_code}: {r.text[:200]}")
                     return {"success": False, "error": f"http_{r.status_code}"}
-        
         except httpx.TimeoutException:
             print(f"[RefState] ✗ Таймаут при сохранении detailed")
             return {"success": False, "error": "timeout"}
